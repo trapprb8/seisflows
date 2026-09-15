@@ -37,7 +37,7 @@ from seisflows.tools.graphics import plot_optim_stats
 from seisflows.tools.math import angle, dot
 from seisflows.tools.model import Model
 from seisflows.plugins import line_search as line_search_dir
-
+np.set_printoptions(precision=16, floatmode="maxprec", suppress=False)
 
 class Gradient:
     """
@@ -375,6 +375,7 @@ class Gradient:
         logger.info("calculating gradient dot products GTG and GTP")
         gtg = dot(g.vector, g.vector)
         gtp = dot(g.vector, p.vector)
+        logger.info(f"GTG={gtg:.16e}  GTP={gtp:.16e}  (expect GTP<0 for descent)")
 
         # Restart plugin line search if the optimization library restarts, 
         # restart conditions are determined in `Optimize.compute_direction()`
@@ -400,9 +401,15 @@ class Gradient:
 
         # Log out the current line search stats for reference
         x, f, idx = self._line_search.get_search_history()
+        if len(f) >= 2:
+                dJ_step = f[-1] - f[-2]
+                dJ_tot  = f[-1] - f[0]
+                logger.info(f"dJ_step={dJ_step:.16E}  dJ_total={dJ_tot:.16E}  (rel={dJ_tot/max(abs(f[0]),1e-30):.3E})")
+
+        
         idx_str = ", ".join([f"{_:>9}" for _ in idx])   # step count
-        x_str = ", ".join([f"{_:.3E}" for _ in x])  # step length
-        f_str = ", ".join([f"{_:.3E}" for _ in f])  # misfit value
+        x_str = ", ".join([f"{_:.16E}" for _ in x])  # step length
+        f_str = ", ".join([f"{_:.16E}" for _ in f])  # misfit value
         logger.info(f"step count  = {idx_str}")
         logger.info(f"step length = {x_str}")
         logger.info(f"misfit val  = {f_str}")
@@ -571,7 +578,7 @@ class Gradient:
 
         # Figure out what step length and step count that corresponds to
         self.save_vector("f_new", f.min())
-        logger.info(f"misfit of accepted trial model is f={f.min():.3E}")
+        logger.info(f"misfit of accepted trial model is f={f.min():.16E}")
 
         logger.info("resetting line search step count to 0")
         self._line_search.step_count = 0
@@ -700,14 +707,14 @@ class Gradient:
                         val = f[0]
                     else:
                         val = 0
-                    _write_vals.append(f"{val:6.3E}") 
+                    _write_vals.append(f"{val:6.16E}") 
                 stats_str = ",".join(_write_vals) + "\n"
                 f_.write(stats_str)  
 
         # Write stats for the current, finished, line search
         stats = self.get_stats()
         with open(fid, "a") as f_:
-            stats_str = [f"{stats[key]:6.3E}" for key in keys]
+            stats_str = [f"{stats[key]:6.16E}" for key in keys]
             stats_str = ",".join(stats_str) + "\n"
             f_.write(stats_str)
 

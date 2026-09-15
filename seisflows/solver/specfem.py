@@ -19,16 +19,350 @@ TODO
 """
 import os
 import sys
+import shlex
+from seisflows.tools import unix
 import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor, wait
 from glob import glob
-
+import numpy as np
 from seisflows import logger
 from seisflows.tools import msg, unix
 from seisflows.tools.config import get_task_id, Dict
 from seisflows.tools.model import Model
-from seisflows.tools.specfem import getpar, setpar, check_source_names
+from seisflows.tools.specfem import (getpar, setpar, check_source_names,
+                                      read_fortran_binary, write_fortran_binary)
+
+####PATCH MAX####
+# --- begin: per-proc size alignment helper ---
+import re
+from pathlib import Path
+import numpy as np
+
+import os, re
+from pathlib import Path
+import numpy as np
+
+#### PATCH MAX ####
+
+#Hilfsfunktion: kann später denk ich weg:
+def _find_global_surface_z(model_init_dir, zs_hint=None, logger=None):
+    """Liest alle proc??????_z.bin aus model_init_dir und liefert den globalen Oberflächen-z.
+       Wenn zs_hint (Quellentiefe) gegeben ist, wird die Richtung automatisch erkannt."""
+    zmins, zmaxs = [], []
+    for zfile in sorted(Path(model_init_dir).glob("proc??????_z.bin")):
+        try:
+            zz = np.fromfile(zfile, dtype=np.float32)
+        except Exception:
+            continue
+        if zz.size:
+            zmins.append(float(zz.min()))
+            zmaxs.append(float(zz.max()))
+    if not zmins:
+        if logger: logger.warning("[mask] cannot determine global surface z (no z.bin found)")
+        return None
+
+    gmin, gmax = min(zmins), max(zmaxs)
+    if zs_hint is None:
+        # Default: Oberfläche = größter z-Wert (häufig in Specfem2D)
+        zsurf = gmax
+    else:
+        # Nimm das Ende, das näher an der Quellentiefe liegt
+        zsurf = gmax if abs(gmax - zs_hint) <= abs(zs_hint - gmin) else gmin
+
+    if logger: logger.info(f"[mask] global surface z: {zsurf:.6f} (zmin={gmin:.6f}, zmax={gmax:.6f}, hint={zs_hint})")
+    return zsurf
+
+
+def _find_global_x_bounds(model_init_dir, logger=None):
+    """Liest alle proc??????_x.bin aus model_init_dir und liefert den globalen
+       linken/rechten Modellrand (x_left, x_right)."""
+    xmins, xmaxs = [], []
+    for xfile in sorted(Path(model_init_dir).glob("proc??????_x.bin")):
+        try:
+            xx = np.fromfile(xfile, dtype=np.float32)
+        except Exception:
+            continue
+        if xx.size:
+            xmins.append(float(xx.min()))
+            xmaxs.append(float(xx.max()))
+    if not xmins:
+        if logger: logger.warning("[mask] cannot determine global x bounds (no x.bin found)")
+        return None, None
+
+    x_left, x_right = min(xmins), max(xmaxs)
+    if logger: logger.info(f"[mask] global x bounds: left={x_left:.6f}, right={x_right:.6f}")
+    return x_left, x_right
+
+
+####PATCH MAX: lokal begrenztes Smoothing um Void-Waende####
+# Motivation: xsmooth_sem glaettet global mit einer einzigen Spannweite.
+# Scharfe, einspringende Void-Ecken sind FEM-Singularitaeten (keine lokale
+# Netzverfeinerung, kein Smoothing -> Rauschen bis weit ausserhalb des
+# physikalischen vp/vs-Bereichs, siehe Analyse). Globales Smoothing daempft
+# dieses Randrauschen zwar, verwischt aber gleichzeitig echte, aehnlich
+# kleine Materialanomalien (Einschluesse) im ganzen Modellgebiet.
+# Diese Erweiterung mischt die global geglaettete Kernel-Datei nur INNERHALB
+# eines schmalen Puffers um die erkannten Void-Waende ein; ausserhalb bleibt
+# der rohe (ungeglaettete) Kernel unveraendert. Ueber den SeisFlows-Parameter
+# `local_void_smooth_buffer_m` steuerbar (z.B. per `seisflows par
+# local_void_smooth_buffer_m 0.02` in 1_SpecFEM_setup.py), 0 (Default) = aus.
+# WICHTIG: `smooth_h`/`smooth_v` muessen weiterhin > 0 sein, sonst hat
+# xsmooth_sem nichts Sinnvolles zum Einmischen (siehe smooth()-Aufruf unten).
+
+
+def _void_boundary_weight(x, z, buffer_m, cell_size_factor=3.5,
+                           edge_margin_m=None, logger=logger):
+    """
+    Gewichtsfeld in [0,1] je GLL-Punkt (x,z): 1 direkt an einer Void-Wand,
+    linear abfallend auf 0 ab `buffer_m` Abstand. Bestimmt Void-Waende ueber
+    Rasterbelegung (regelmaessiges Binning, Zellgroesse deutlich groesser als
+    der typische GLL-Punktabstand, aber viel kleiner als jede Anomalie):
+    belegte Zellen mit mindestens einem leeren 3x3-Nachbarn sind Randzellen.
+
+    HINWEIS: eine reine Nachbarschafts-DICHTE (statt Rasterbelegung) waere
+    hier ungeeignet -- GLL-Knoten liegen INNERHALB eines Spektralelements
+    absichtlich ungleichmaessig (Gauss-Lobatto-Legendre-Verteilung, dichter
+    an Elementkanten), das wuerde grosse Teile des Volumenmaterials faelschlich
+    als "duenn besetzt" markieren (empirisch geprueft: >30% des gesamten
+    Gebiets statt nur der beiden echten Voids).
+
+    Die Aussenkante der Modelldomaene wird ueber einen physischen Randstreifen
+    (`edge_margin_m`, per Default max(2cm, 3 Zellen)) ausgeschlossen, da die
+    Punktwolke dort ebenfalls "leere" Nachbarzellen ausserhalb der Bounding-Box
+    hat. Materialkontraste (Einschluesse) erzeugen KEINE leeren Zellen und
+    werden dadurch nicht als Rand erkannt -- das ist beabsichtigt.
+    """
+    from scipy.ndimage import binary_erosion
+    from scipy.spatial import cKDTree
+
+    x = np.asarray(x, dtype=np.float64)
+    z = np.asarray(z, dtype=np.float64)
+    n = len(x)
+    if n == 0:
+        return np.zeros(0)
+
+    # typischer GLL-Punktabstand; Duplikate an Elementkanten (Abstand 0)
+    # zuerst entfernen, sonst wird die Median-Schaetzung durch sie verzerrt
+    keys = np.round(np.column_stack([x, z]), 6)
+    uniq = np.unique(keys, axis=0)
+    if len(uniq) < 2:
+        if logger:
+            logger.warning("[local_smooth] zu wenige eindeutige Punkte -> "
+                            "kein lokales Smoothing angewendet")
+        return np.zeros(n)
+    d_nn, _ = cKDTree(uniq).query(uniq, k=2)
+    typical_spacing = float(np.median(d_nn[:, 1]))
+    if not np.isfinite(typical_spacing) or typical_spacing <= 0:
+        if logger:
+            logger.warning("[local_smooth] konnte Rasterabstand nicht bestimmen -> "
+                            "kein lokales Smoothing angewendet")
+        return np.zeros(n)
+
+    cell = cell_size_factor * typical_spacing
+    x_lo, x_hi = x.min(), x.max()
+    z_lo, z_hi = z.min(), z.max()
+    nx = int(np.ceil((x_hi - x_lo) / cell)) + 2
+    nz = int(np.ceil((z_hi - z_lo) / cell)) + 2
+    ix = np.clip(((x - x_lo) / cell).astype(int), 0, nx - 1)
+    iz = np.clip(((z - z_lo) / cell).astype(int), 0, nz - 1)
+    occ = np.zeros((nz, nx), dtype=bool)
+    occ[iz, ix] = True
+
+    interior = binary_erosion(occ, structure=np.ones((3, 3), dtype=bool))
+    boundary_cells = occ & ~interior
+
+    if edge_margin_m is None:
+        edge_margin_m = max(0.02, 3 * cell)
+    edge_cells = int(np.ceil(edge_margin_m / cell))
+    outer = np.zeros_like(occ)
+    outer[:edge_cells, :] = True
+    outer[-edge_cells:, :] = True
+    outer[:, :edge_cells] = True
+    outer[:, -edge_cells:] = True
+    void_wall_cells = boundary_cells & ~outer
+
+    n_cells = int(void_wall_cells.sum())
+    if logger:
+        logger.info(f"[local_smooth] {n_cells} Void-Wand-Zellen erkannt "
+                    f"(Zellgroesse {cell*1000:.1f}mm, Randstreifen "
+                    f"{edge_margin_m*1000:.0f}mm, Puffer {buffer_m*1000:.0f}mm)")
+    if n_cells == 0:
+        return np.zeros(n)
+
+    zc, xc = np.where(void_wall_cells)
+    wall_pts = np.column_stack([x_lo + (xc + 0.5) * cell, z_lo + (zc + 0.5) * cell])
+    wall_tree = cKDTree(wall_pts)
+    dist, _ = wall_tree.query(np.column_stack([x, z]), k=1)
+    return np.clip(1.0 - dist / buffer_m, 0.0, 1.0)
+
+
+def _blend_local_void_smoothing(input_path, output_path, parameters, ext,
+                                 buffer_m, logger=logger):
+    """
+    Ersetzt die global (xsmooth_sem-)geglaetteten Kernel-Dateien in
+    `output_path` durch eine Mischung aus roh (`input_path`) und geglaettet:
+    volle Glaettung nur innerhalb `buffer_m` um die erkannten Void-Waende,
+    ausserhalb unveraendert roh. Reine Nachbearbeitung bereits vorhandener
+    Dateien -- xsmooth_sem/MPI-Aufruf bleiben unangetastet.
+    """
+    for xfile in sorted(Path(input_path).glob(f"proc??????_x{ext}")):
+        proc = xfile.name.split("_")[0]
+        zfile = Path(input_path) / f"{proc}_z{ext}"
+        if not zfile.exists():
+            if logger:
+                logger.warning(f"[local_smooth] {zfile} fehlt -> {proc} uebersprungen")
+            continue
+        x = np.fromfile(xfile, dtype="float32")
+        z = np.fromfile(zfile, dtype="float32")
+        weight = _void_boundary_weight(x, z, buffer_m=buffer_m, logger=logger)
+
+        for par in parameters:
+            raw_file = Path(input_path) / f"{proc}_{par}_kernel{ext}"
+            smooth_file = Path(output_path) / f"{proc}_{par}_kernel{ext}"
+            if not (raw_file.exists() and smooth_file.exists()):
+                if logger:
+                    logger.warning(f"[local_smooth] {raw_file.name} oder "
+                                    f"{smooth_file.name} fehlt -> uebersprungen")
+                continue
+            raw = np.fromfile(raw_file, dtype="float32")
+            smoothed = np.fromfile(smooth_file, dtype="float32")
+            if raw.shape != weight.shape or smoothed.shape != weight.shape:
+                if logger:
+                    logger.warning(f"[local_smooth] Groessen passen nicht zusammen "
+                                    f"({proc}_{par}) -> uebersprungen")
+                continue
+            blended = (weight * smoothed + (1.0 - weight) * raw).astype("float32")
+            blended.tofile(smooth_file)
+        if logger:
+            logger.info(f"[local_smooth] {proc}: lokal geglaettet "
+                        f"(Puffer {buffer_m*1000:.0f}mm um Void-Wand)")
+#### PATCH MAX ####
+
+
+def _crop_kernel_to_model_size(
+    kfile,
+    model_dir=None,
+    dtype="float32",
+    backup=True,
+    logger=logger,
+):
+    """
+    Bringt ein einzelnes Kernel-Binärfile (…/procXXXXXX_{vp|vs}_kernel.bin)
+    exakt auf die Länge der entsprechenden MODEL-Datei
+    (…/OUTPUT_FILES_INIT/procXXXXXX_{vp|vs}.bin).
+
+    Return:
+      >0  : Anzahl abgeschnittener Elemente
+       0  : nichts geändert
+    """
+    itemsize = np.dtype(dtype).itemsize
+    kpath = Path(kfile)
+
+    # proc + Feld erkennen (vp, vs, optional rho)
+    m = re.match(r"^(proc\d{6})_([a-zA-Z0-9]+)_kernel\.bin$", kpath.name)
+    if not m:
+        if logger:
+            logger.debug(f"[crop] übersprungen (Pattern passt nicht): {kpath.name}")
+        return 0
+    proc, field = m.group(1), m.group(2)
+
+    # --- Modell-Datei suchen ---
+    candidates = []
+    if model_dir is not None:
+        candidates.append(Path(model_dir))
+    else:
+        # häufige Orte – Reihenfolge: bevorzugt OUTPUT_FILES_INIT
+        candidates += [
+            Path.cwd() / "specfem2d_workdir" / "OUTPUT_FILES_INIT",
+            Path.cwd() / "OUTPUT_FILES_INIT",
+        ]
+        # falls du self.path._mainsolver oder self.path.model_databases hast:
+        try:
+            from . import paths  # falls du eine Pfadklasse hast; sonst ignorieren
+            ms = Path(paths.Path._mainsolver) / "specfem2d_workdir" / "OUTPUT_FILES_INIT"
+            candidates.append(ms)
+        except Exception:
+            pass
+
+    mfile = None
+    for c in candidates:
+        candidate = Path(c) / f"{proc}_{field}.bin"
+        if candidate.exists():
+            mfile = candidate
+            break
+
+    if mfile is None:
+        if logger:
+            logger.warning(f"[crop] Model-Datei nicht gefunden für {proc}_{field}. "
+                           f"Gesucht in: {', '.join(str(p) for p in candidates)}")
+        return 0
+
+    try:
+        expected_elems = os.path.getsize(mfile) // itemsize
+    except OSError as e:
+        if logger: logger.warning(f"[crop] Kann Größe nicht lesen: {mfile}: {e}")
+        return 0
+
+    try:
+        k_bytes = os.path.getsize(kpath)
+    except OSError as e:
+        if logger: logger.warning(f"[crop] Kernel fehlt/unerreichbar: {kpath}: {e}")
+        return 0
+
+    if k_bytes % itemsize != 0:
+        if logger:
+            logger.warning(f"[crop] Unerwartete Kernel-Bytegröße (kein Vielfaches von {itemsize}): {kpath}")
+        # hier dennoch weiter, SPECFEM kann sonst stolpern
+    k_elems = k_bytes // itemsize
+
+    if k_elems == expected_elems:
+        return 0
+
+    # Backup
+    bak = kpath.with_suffix(kpath.suffix + ".precrop")
+    if backup and not bak.exists():
+        try:
+            kpath.replace(bak)
+            # weiterarbeiten ab Backup
+            kpath = bak  # Quelle bleibt bak; Ziel wird der ursprüngliche Name ohne .precrop
+        except OSError as e:
+            if logger: logger.warning(f"[crop] Backup fehlgeschlagen: {bak}: {e}")
+
+    if k_elems > expected_elems:
+        # Ziel: ursprünglicher Dateiname ohne .precrop
+        out_path = Path(str(kpath).replace(".precrop", ""))
+        # wir kopieren nur die ersten expected_elems*itemsize Bytes
+        nbytes = expected_elems * itemsize
+        with open(kpath, "rb") as fin, open(out_path, "wb") as fout:
+            # chunked copy
+            left = nbytes
+            bufsize = 1024 * 1024
+            while left > 0:
+                chunk = fin.read(min(bufsize, left))
+                if not chunk:
+                    break
+                fout.write(chunk)
+                left -= len(chunk)
+        if logger:
+            logger.info(f"[crop] {out_path.name}: {k_elems} -> {expected_elems} "
+                        f"(-{k_elems - expected_elems} Elemente)")
+        return k_elems - expected_elems
+
+    # Kernel kleiner als Modell – kein Padding vornehmen
+    if logger:
+        logger.warning(f"[crop] {Path(str(kpath).replace('.precrop','')).name}: "
+                       f"Kernel kleiner als Model ({k_elems} < {expected_elems}); kein Padding.")
+    # Falls wir ein Backup angelegt haben und noch keine gültige Zieldatei existiert:
+    out_path = Path(str(kpath).replace(".precrop", ""))
+    if backup and not out_path.exists():
+        # Original (bak) zurückspielen
+        try:
+            Path(kpath).replace(out_path)
+        except OSError:
+            pass
+    return 0
+
 
 
 class Specfem:
@@ -89,6 +423,12 @@ class Specfem:
             around vertex to smooth. Much faster than Gaussian.
         - 'pde' [3D]: RECOMMENDED for 3D. Diffusion-based PDE smoothing. 
             Much faster than Gaussian. See SPECFEM3D PR#1725
+    :type smooth_use_gpu: bool
+    :param smooth_use_gpu: Use GPU acceleration for xsmooth_sem (passes
+        '.true' instead of '.false'). Requires CUDA-compiled binaries and an
+        available GPU. For large meshes (>500k GLL points) with sigma > a few
+        element widths, CPU smoothing can take hours; GPU is typically 100x
+        faster. Default: False.
     :type components: str
     :param components: components to search for synthetic data with. None by
         default which uses a wildcard when searching for synthetics. If
@@ -120,13 +460,39 @@ class Specfem:
         running SPECFEM
     ***
     """
-    def __init__(self, syn_data_format="ascii",  materials="acoustic",
+    def __init__(self, syn_data_format="ascii", materials="acoustic",
                  update_density=False, nproc=1, ntask=1, attenuation=False,
-                 smooth_h=0., smooth_v=0., smooth_type="gaussian", 
-                 components=None, source_prefix=None, mpiexec=None, 
+                 smooth_h=0., smooth_v=0., smooth_type="gaussian",
+                 components=None, source_prefix=None, mpiexec=None,
                  workdir=os.getcwd(), path_solver=None, path_eval_grad=None,
                  path_data=None, path_specfem_bin=None, path_specfem_data=None,
                  path_model_init=None, path_model_true=None, path_output=None,
+                 # >>> Neu:
+                 limit_vpvs=False,
+                 vp_min=None,
+                 vp_max=None,
+                 vs_min=None,
+                 vs_max=None,
+                 # --- Poisson control (optional) ---
+                 limit_poisson=False,
+                 nu_min=0.05,
+                 nu_max=0.45,
+                 nu_strategy="vp_from_vs",     # or: "vs_from_vp"
+                 nu_skip_vs_below=1.0,                                       
+                 mask_sr=False,
+                 mask_src_radius_m=0.0,
+                 mask_rec_radius_m=0.0,
+                 mask_taper_m=0.0,               
+                 # --- NEU: Top-Layer-Optionen ---
+                 mask_top_layer=False,
+                 mask_top_thickness_m=0.0,
+                 mask_top_taper_m=0.0,
+                 # --- NEU: Side-Layer-Optionen (links/rechts) ---
+                 mask_side_layer=False,
+                 mask_side_thickness_m=0.0,
+                 mask_side_taper_m=0.0,
+                 smooth_use_gpu=False,
+                 local_void_smooth_buffer_m=0.0,
                  **kwargs):
         """
         Set default SPECFEM interface parameters
@@ -150,6 +516,38 @@ class Specfem:
         :param path_output: shared output directory on disk for more permanent
             storage of solver related files such as traces, kernels, gradients.
         """
+        
+        
+        # >>> Neu PATCH MAX
+        self.mask_sr = bool(mask_sr)
+        self.mask_src_radius_m = float(mask_src_radius_m)
+        self.mask_rec_radius_m = float(mask_rec_radius_m)
+        self.mask_taper_m = float(mask_taper_m)
+        # --- NEU: Top-Layer speichern ---
+        self.mask_top_layer = bool(mask_top_layer)
+        self.mask_top_thickness_m = float(mask_top_thickness_m)
+        self.mask_top_taper_m = float(mask_top_taper_m)
+        # --- NEU: Side-Layer speichern (links/rechts) ---
+        self.mask_side_layer = bool(mask_side_layer)
+        self.mask_side_thickness_m = float(mask_side_thickness_m)
+        self.mask_side_taper_m = float(mask_side_taper_m)
+        self.smooth_use_gpu = bool(smooth_use_gpu)
+        # --- lokal begrenztes Smoothing um Void-Waende (0 = aus, siehe smooth()) ---
+        self.local_void_smooth_buffer_m = float(local_void_smooth_buffer_m)
+        # --- Velocity clipping (optional) ---
+        # When enabled, clamp vp and vs in every trial model before any
+        # forward run. Bounds can be left as None to disable a side.
+        self.limit_vpvs = bool(limit_vpvs)
+        self.vp_min = None if vp_min is None else float(vp_min)
+        self.vp_max = None if vp_max is None else float(vp_max)
+        self.vs_min = None if vs_min is None else float(vs_min)
+        self.vs_max = None if vs_max is None else float(vs_max)     
+        # --- Poisson control (optional) ---
+        self.limit_poisson   = bool(limit_poisson)
+        self.nu_min          = float(nu_min)
+        self.nu_max          = float(nu_max)
+        self.nu_strategy     = str(nu_strategy)
+        self.nu_skip_vs_below = float(nu_skip_vs_below)
         # Publically accessible parameters
         self.syn_data_format = syn_data_format
         self.materials = materials
@@ -237,6 +635,7 @@ class Specfem:
         """
         Checks parameter validity for SPECFEM input files and model parameters
         """
+        from glob import glob
         if isinstance(self.materials, str):
             assert(self.materials.upper() in self._available_materials), (
             f"Although `self.materials` is a valid material type, it is not an "
@@ -413,6 +812,141 @@ class Specfem:
                 msg.cli(str(e), header="model read error", border="=")
             )
             sys.exit(-1)
+
+################ PATCH MAX ####################
+
+    def enforce_model_bounds(self, model):
+        """
+        Optionally clamp vp/vs values in a Model instance in-place.
+        Works for 'vp'/'vs' and region-tagged names like 'reg1_vp'.
+        """
+        limit_v  = bool(getattr(self, "limit_vpvs", False))
+        limit_nu = bool(getattr(self, "limit_poisson", False))
+        if not (limit_v or limit_nu):
+            return model
+
+
+        import numpy as np
+        from seisflows import logger
+
+        def _clip_param(param_key, vmin, vmax):
+            if vmin is None and vmax is None:
+                return 0
+            affected = 0
+            for key in list(model.model.keys()):
+                if key.split("_")[-1] != param_key:
+                    continue
+                arrs = model.model[key]
+                for i in range(len(arrs)):
+                    arr = arrs[i]
+                    orig = arr.copy()
+                    lo = -np.inf if vmin is None else float(vmin)
+                    hi =  np.inf if vmax is None else float(vmax)
+                    mask = (orig < lo) | (orig > hi)
+                    np.clip(arr, lo, hi, out=arr)
+                    affected += int(mask.sum())
+            return affected
+
+        if limit_v:
+            n_vp = _clip_param("vp", self.vp_min, self.vp_max)
+            n_vs = _clip_param("vs", self.vs_min, self.vs_max)
+            
+        # --- Poisson nach dem Basis-Clipping erzwingen ---
+        if limit_nu:
+            c_vp, c_vs = self.enforce_poisson_ratio(model)
+            if limit_v:
+                # harte vp/vs-Bounds final erneut anwenden
+                n_vp += _clip_param("vp", self.vp_min, self.vp_max)
+                n_vs += _clip_param("vs", self.vs_min, self.vs_max)
+            if c_vp or c_vs:
+                logger.info(f"poisson ratio enforced: changed {c_vp} vp and {c_vs} vs elements")
+
+        if limit_v:
+            if n_vp or n_vs:
+                logger.info(
+                    f"velocity clipping applied: "
+                    f"{n_vp} vp values and {n_vs} vs values clipped to "
+                    f"[{self.vp_min},{self.vp_max}] / [{self.vs_min},{self.vs_max}]"
+                )
+            else:
+                logger.debug("velocity clipping enabled but no values out of bounds")
+
+
+
+        return model
+
+    def enforce_poisson_ratio(self, model):
+        """
+        Erzwingt nu_min <= nu <= nu_max, indem das Verhältnis R = vp/vs
+        zwischen Rmin und Rmax begrenzt wird. Standard: passe vp an (vs fix).
+        Fluide/Hohlraum (vs <= nu_skip_vs_below) werden übersprungen.
+        """
+        if not getattr(self, "limit_poisson", False):
+            return 0, 0  # keine Änderungen
+    
+        import numpy as np
+        from seisflows import logger
+    
+        # R(ν) = sqrt(2(1-ν)/(1-2ν))
+        def R(nu):
+            return np.sqrt(2.0*(1.0-nu) / np.maximum(1e-12, 1.0-2.0*nu))
+    
+        Rmin = R(self.nu_min)
+        Rmax = R(self.nu_max)
+        if not np.isfinite(Rmin) or not np.isfinite(Rmax) or Rmin <= 0 or Rmax <= 0 or Rmin > Rmax:
+            logger.warning(f"invalid Poisson bounds: nu_min={self.nu_min}, nu_max={self.nu_max} -> skip")
+            return 0, 0
+    
+        changed_vp = 0
+        changed_vs = 0
+    
+        # finde passende vp/vs-Schlüssel (unterstützt reg?-vp/vs)
+        keys_vp = [k for k in model.model.keys() if k.split("_")[-1] == "vp"]
+        for k_vp in keys_vp:
+            k_vs = k_vp[:-2] + "vs"  # '..._vp' -> '..._vs'
+            if k_vs not in model.model:
+                continue
+    
+            vp_list = model.model[k_vp]
+            vs_list = model.model[k_vs]
+            for i in range(len(vp_list)):
+                vp = vp_list[i]
+                vs = vs_list[i]
+    
+                # Solids: vs > Schwelle
+                solid = vs > float(self.nu_skip_vs_below)
+                if not np.any(solid):
+                    continue
+    
+                if self.nu_strategy.lower() == "vp_from_vs":
+                    lo = Rmin * vs
+                    hi = Rmax * vs
+                    before = vp.copy()
+                    # nur dort clippen, wo solid
+                    vp[solid] = np.minimum(np.maximum(vp[solid], lo[solid]), hi[solid])
+                    changed_vp += int(np.count_nonzero(vp != before))
+    
+                elif self.nu_strategy.lower() == "vs_from_vp":
+                    # Vs-Band aus vp ableiten
+                    lo = vp / Rmax
+                    hi = vp / Rmin
+                    before = vs.copy()
+                    vs[solid] = np.minimum(np.maximum(vs[solid], lo[solid]), hi[solid])
+                    changed_vs += int(np.count_nonzero(vs != before))
+    
+                else:
+                    # Fallback: wie vp_from_vs
+                    lo = Rmin * vs
+                    hi = Rmax * vs
+                    before = vp.copy()
+                    vp[solid] = np.minimum(np.maximum(vp[solid], lo[solid]), hi[solid])
+                    changed_vp += int(np.count_nonzero(vp != before))
+    
+        return changed_vp, changed_vs
+
+
+##############################################
+
 
     def set_parameters(self, keys, vals, file, delim, **kwargs):
         """
@@ -882,52 +1416,535 @@ class Specfem:
             if names:
                 logger.info(f"renaming {len(names)} kernels: '{tag}' -> 'vs'")
                 unix.rename(old="beta", new="vs", names=names)
+        # --- acoustic filename conventions -> SeisFlows conventions ---
+        ############PATCH MAX############# AKUSTISCHE SIMULATIONEN
+        # Vp (Schallgeschwindigkeit)
+        names = glob(self.model_wildcard(par="c_acoustic", kernel=True))
+        if names:
+            logger.info(f"renaming {len(names)} kernels: 'c_acoustic' -> 'vp'")
+            unix.rename(old="c_acoustic", new="vp", names=names)
+        
+        # Bulk modulus (kappa)
+        names = glob(self.model_wildcard(par="kappa_acoustic", kernel=True))
+        if names:
+            logger.info(f"renaming {len(names)} kernels: 'kappa_acoustic' -> 'kappa'")
+            unix.rename(old="kappa_acoustic", new="kappa", names=names)
+        
+        # Dichte (rho)
+        names = glob(self.model_wildcard(par="rho_acoustic", kernel=True))
+        if names:
+            logger.info(f"renaming {len(names)} kernels: 'rho_acoustic' -> 'rho'")
+            unix.rename(old="rho_acoustic", new="rho", names=names)
+        
+        # (optional) rhop -> rhop (falls du das je nutzen willst)
+        names = glob(self.model_wildcard(par="rhop_acoustic", kernel=True))
+        if names:
+            logger.info(f"renaming {len(names)} kernels: 'rhop_acoustic' -> 'rhop'")
+            unix.rename(old="rhop_acoustic", new="rhop", names=names)
+        ############################################
 
+   
     def combine(self, input_paths, output_path, parameters=None):
-        """
-        Wrapper for 'xcombine_sem'.
-        Sums kernels from individual source contributions to create gradient.
-
-        .. note::
-            The binary xcombine_sem simply sums matching databases
-
-        .. note::
-            It is ASSUMED that this function is being called by
-            system.run(single=True) so that we can use the main solver
-            directory to perform the kernel summation task
-
-        :type input_paths: list
-        :param input_paths: list of paths to directories containing binary
-            files to be combined
-        :type output_path: str
-        :param output_path: path to export the outputs of xcombine_sem
-        :type parameters: list
-        :param parameters: optional list of parameters,
-            defaults to `self._parameters`
-        """
-        unix.cd(self.cwd)
-
+        
+        
+        # --- Guard: Kernel pro-Proc auf Modellgröße trimmen ---
+        model_dir = Path(self.path._mainsolver) / "specfem2d_workdir" / "OUTPUT_FILES_INIT"
+    
+        kdir = Path(self.path.eval_grad) / "misfit_kernel"   # <— self.path, nicht self.paths
+        klist = sorted(kdir.glob("proc*_vp_kernel.bin")) + sorted(kdir.glob("proc*_vs_kernel.bin"))
+        for kfile in klist:
+            _crop_kernel_to_model_size(str(kfile), model_dir=model_dir, dtype="float32",
+                                       backup=True, logger=logger)
+        # ------------------------------------------------------
+    
+        # Im mainsolver ausführen (falls vorhanden), sonst self.cwd
+        workdir = self.path._mainsolver if os.path.isdir(self.path._mainsolver) else self.cwd
+        logger.debug(f"[combine] using workdir={workdir}")
+        unix.cd(workdir)
+        logger.debug(f"[combine] cwd={os.getcwd()}")
+    
         if parameters is None:
             parameters = self._parameters
-
+            
+         # Stelle sicher, dass alle Namen auf *_kernel enden
+        parameters = [
+            p if p.endswith("_kernel") else f"{p}_kernel"
+            for p in parameters
+        ]   
         if not os.path.exists(output_path):
             unix.mkdir(output_path)
-
-        # Write the source names into the kernel paths file for SEM/ directory
+    
+        # Pfade der Events an xcombine_sem übergeben
         with open("kernel_paths", "w") as f:
-            for input_path in input_paths:
-                f.write(f"{input_path}\n")
+            for p in input_paths:
+                f.write(f"{p}\n")
+    
+        exe = os.path.join(self.path.specfem_bin, "xcombine_sem")
+        if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+            logger.critical(f"xcombine_sem not found or not executable: {exe}")
+            sys.exit(1)
+    
+        import shutil
+        n_tasks = int(os.environ.get("SLURM_NTASKS", "1"))
+        if shutil.which("mpirun"):      launcher = f"mpirun -n {n_tasks}"    # mpirun bevorzugt
+        elif shutil.which("mpiexec"):   launcher = f"mpiexec -n {n_tasks}"
+        elif shutil.which("srun"):      launcher = f"srun -n {n_tasks}"
+        else:
+            logger.critical("No MPI launcher found (srun/mpirun/mpiexec).")
+            sys.exit(1)
+        logger.debug(f"[combine] using MPI launcher: {launcher}")
+    
+        for name in parameters:  # erwartet z.B. 'vp_kernel', 'vs_kernel'
+            cmd = f"{launcher} {exe} {name} kernel_paths {output_path}"
+            stdout = f"{self._exc2log(exe)}_{name}.log"     # <— auf Binary loggen
+            self._run_binary(executable=cmd, stdout=stdout, with_mpi=False)
+    
+        # Danach: Masking auf dem kombinierten Kernel
+        self._debug_sizes_summary(output_path, parameters=parameters)
+        try:
+            if getattr(self, "mask_sr", False) or getattr(self, "mask_top_layer", False):
+                logger.info(
+                    f"applying source/receiver mask to '{output_path}' "
+                    f"(src_r={self.mask_src_radius_m} m, "
+                    f"rec_r={self.mask_rec_radius_m} m, "
+                    f"taper={self.mask_taper_m} m)"
+                )
+                self._mask_gradient_near_sr(input_path=output_path, parameters=parameters)
+        except Exception as e:
+            logger.warning(f"source/receiver kernel mask failed: {e}")
 
-        # Call on xcombine_sem to combine kernels into a single file
-        for name in parameters:
-            # e.g.: mpiexec bin/xcombine_sem alpha_kernel kernel_paths output/
-            exc = f"bin/xcombine_sem {name} kernel_paths {output_path}"
-            # e.g., smooth_vp.log
-            stdout = f"{self._exc2log(exc)}_{name}.log"
-            self._run_binary(executable=exc, stdout=stdout, with_mpi=True)
+    
+        # --- Größenbilanz für Debugging (hilft bei shape-Mismatches) --------------
+        self._debug_sizes_summary(output_path, parameters=parameters)
+
+
+    ############# --- PATCH MAX FUER DIE NÄCHSTEN FUNKTIONEN
+    ############# GRADIENTEN ZU NULL SETZEN AN SENDERN UND EMPFAENGERN
+    
+    def _debug_sizes_summary(self, kernel_dir, parameters=None):
+        """Schreibt eine kompakte Größenbilanz ins Log:
+           - Kernel-Dateigrößen (Summe -> erwartete Gradient-Länge)
+           - Rohgrößen der Modelldateien an verschiedenen Orten
+           - Vektorlängen laut Model-Klasse (ob Ghosts verworfen werden)
+        """
+        if parameters is None:
+            parameters = self._parameters
+    
+        logger.info("[mask][debug] ===== SIZE SUMMARY (start) =====")
+        # --- Kernel-Dateien
+        total_kernel = 0
+        for par in parameters:
+            # Stelle sicher, dass wir wirklich nach *_kernel suchen
+            par_tag = par if par.endswith("_kernel") else f"{par}_kernel"
+            matched = []
+            for pat in self._kernel_file_patterns(kernel_dir, par_tag):
+                files = glob(pat)
+                logger.info(f"[debug] kernel pattern '{pat}' -> {len(files)} files")
+                matched.extend(files)
+            for f in sorted(set(matched)):
+                n = os.path.getsize(f) // 4  # float32
+                total_kernel += n
+                logger.info(f"[debug] kernel file {os.path.basename(f)} : {n} float32")
+        logger.info(f"[debug] total kernel elements (sum over files) = {total_kernel}")
+    
+        # --- Rohgrößen der Modelldateien an typischen Orten
+        model_places = [
+            ("mainsolver/DATA", os.path.join(self.path._mainsolver, self.model_databases)),
+            ("cwd/DATA",        os.path.join(self.cwd, self.model_databases)),
+            ("output/MODEL_INIT", os.path.join(self.path.output, "MODEL_INIT")),
+            ("path_model_init",   self.path.model_init or ""),
+        ]
+        for name, base in model_places:
+            if base and os.path.exists(base):
+                tot = 0
+                for par in parameters:
+                    par_tag = par.replace("_kernel", "")
+                    for f in glob(os.path.join(base, f"proc??????_{par_tag}{self._ext}")):
+                        tot += os.path.getsize(f) // 4
+                logger.info(f"[debug] model raw length sum [{name}] = {tot} float32")
+            else:
+                logger.info(f"[debug] model path missing [{name}] -> {base}")
+    
+        # --- Vektorlängen, wie sie die Model-Klasse sieht (entscheidend für scaling)
+        try:
+            from seisflows.tools.model import Model
+            m_ms = Model(path=os.path.join(self.path._mainsolver, self.model_databases),
+                         parameters=[p.replace("_kernel","") for p in parameters],
+                         regions=self._regions)
+            logger.info(f"[debug] Model.vector length (mainsolver/DATA) = {m_ms.vector.size}")
+        except Exception as e:
+            logger.warning(f"[debug] Model(...) mainsolver failed: {e}")
+        try:
+            if self.path.model_init and os.path.exists(self.path.model_init):
+                m_init = Model(path=self.path.model_init,
+                               parameters=[p.replace("_kernel","") for p in parameters],
+                               regions=self._regions)
+                logger.info(f"[debug] Model.vector length (path_model_init) = {m_init.vector.size}")
+        except Exception as e:
+            logger.warning(f"[debug] Model(...) path_model_init failed: {e}")
+    
+        logger.info("[mask][debug] ===== SIZE SUMMARY (end) =====")
+    
+    def _kernel_file_patterns(self, dirpath, par):
+        """
+        Liefert eine Liste möglicher Pattern für Kernel-Dateien,
+        egal ob 'vs' oder 'vs_kernel' übergeben wurde.
+        """
+        base = par
+        has_kernel = par.endswith("_kernel")
+        patterns = []
+        if has_kernel:
+            # z.B. 'vs_kernel' -> genau so suchen
+            patterns.append(os.path.join(dirpath, f"proc??????_{par}{self._ext}"))
+            # einige Workflows lassen das zweite '_kernel' trotzdem drin:
+            patterns.append(os.path.join(dirpath, f"proc??????_{par}_kernel{self._ext}"))
+        else:
+            # z.B. 'vs' -> Standard 'vs_kernel'
+            patterns.append(os.path.join(dirpath, f"proc??????_{par}_kernel{self._ext}"))
+            # Fallback falls ohne Suffix geschrieben wurde
+            patterns.append(os.path.join(dirpath, f"proc??????_{par}{self._ext}"))
+        return patterns
+
+
+    def _radial_cosine_taper(self, x, z, xc, zc, r0, rt):
+        """
+        1D-Vektorversion: gibt Gewichte in [0,1] zurück.
+        r0: Voll-Mute-Radius, rt: Taperbreite (additiv).
+        """
+        if r0 <= 0.0:
+            return np.ones_like(x, dtype=np.float32)
+        r = np.sqrt((x - xc)**2 + (z - zc)**2)
+        w = np.ones_like(r, dtype=np.float32)
+        # Voll-Mute innerhalb r0
+        w[r <= r0] = 0.0
+        if rt > 0.0:
+            # Kosinus-Taper in [r0, r0+rt]
+            m = (r > r0) & (r < (r0 + rt))
+            w[m] = 0.5 * (1.0 - np.cos(np.pi * (r[m] - r0) / rt))
+            # außerhalb r0+rt bleibt 1.0
+        return w.astype(np.float32)
+
+    def _vertical_top_taper(self, z, z_top, thick, taper):
+        """
+        Kosinus-Taper von unten nach oben auf die oberste 'thick' Schicht.
+        Voll-Mute in [z0, z_top], weicher Übergang in [z0 - taper, z0].
+        """
+        if thick <= 0.0:
+            return np.ones_like(z, dtype=np.float32)
+    
+        z0 = z_top - float(thick)  # Unterkante der voll gemuteten Schicht
+        w = np.ones_like(z, dtype=np.float32)
+    
+        # Voll-Mute in der Top-Schicht
+        w[z >= z0] = 0.0
+    
+        # Optionaler Taper darunter
+        taper = float(taper)
+        if taper > 0.0:
+            m = (z >= (z0 - taper)) & (z < z0)
+            # 1 -> 0 über die Taperstrecke
+            w[m] = 0.5 * (1.0 + np.cos(np.pi * (z[m] - (z0 - taper)) / taper))
+    
+        return w.astype(np.float32)
+
+    def _horizontal_side_taper(self, x, x_left, x_right, thick, taper):
+        """
+        Kosinus-Taper an linkem und rechtem Modellrand (analog zu _vertical_top_taper).
+        Voll-Mute in [x_left, x_left+thick] und [x_right-thick, x_right],
+        weicher Uebergang jeweils ueber 'taper' nach innen.
+        """
+        if thick <= 0.0:
+            return np.ones_like(x, dtype=np.float32)
+
+        w = np.ones_like(x, dtype=np.float32)
+        taper = float(taper)
+
+        # linker Rand: Voll-Mute in [x_left, x0], x0 = x_left + thick
+        x0 = x_left + float(thick)
+        w[x <= x0] = 0.0
+        if taper > 0.0:
+            m = (x > x0) & (x <= (x0 + taper))
+            w[m] = 0.5 * (1.0 - np.cos(np.pi * (x[m] - x0) / taper))
+
+        # rechter Rand: Voll-Mute in [x1, x_right], x1 = x_right - thick
+        x1 = x_right - float(thick)
+        w[x >= x1] = 0.0
+        if taper > 0.0:
+            m = (x < x1) & (x >= (x1 - taper))
+            w[m] = 0.5 * (1.0 - np.cos(np.pi * (x1 - x[m]) / taper))
+
+        return w.astype(np.float32)
+
+    def _read_source_coords(self):
+        """xs,zs aus dem aktuell verlinkten DATA/SOURCE lesen."""
+        srcfile = os.path.join(self.cwd, "DATA", self.source_prefix)
+        # getpar ist im Modul bereits verfügbar
+        xs = float(getpar(key="xs", file=srcfile)[1])
+        zs = float(getpar(key="zs", file=srcfile)[1])
+        return xs, zs
+    
+    def _read_station_coords(self):
+        """Stationsdatei im mainsolver lesen -> Liste [(x,z), ...]."""
+        stas = []
+        stfile = os.path.join(self.cwd, "DATA", "STATIONS")
+        if os.path.exists(stfile):
+            with open(stfile, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    # SPECFEM2D: NET STAX X Z (optional weitere Spalten)
+                    if len(parts) >= 4:
+                        try:
+                            x = float(parts[2]); z = float(parts[3])
+                            stas.append((x, z))
+                        except ValueError:
+                            continue
+        return stas
+    
+    def _find_grid_bins(self, proc):
+        """
+        Suche x/z-Binärgrids für einen MPI-Proc.
+        Bevorzugt output/MODEL_INIT, fällt dann auf klassische Solver-Pfade zurück.
+        """
+        base_dirs = [
+            os.path.join(self.path.output, "MODEL_INIT"),
+            os.path.join(self.cwd, "output", "MODEL_INIT"),
+            os.path.join(self.cwd, "OUTPUT_FILES", "DATABASES_MPI"),
+            os.path.join(self.cwd, "DATA", "DATABASES_MPI"),
+            os.path.join(self.cwd, "DATA"),
+        ]
+        candidates = []
+        for d in base_dirs:
+            candidates += [
+                (d, f"{proc}_x.bin", f"{proc}_z.bin"),            # proc000000_x.bin
+                (d, "x.bin", "z.bin"),                             # x.bin / z.bin
+                (os.path.join(d, proc), "x.bin", "z.bin"),         # proc000000/x.bin
+            ]
+        for d, xname, zname in candidates:
+            xbin = os.path.join(d, xname)
+            zbin = os.path.join(d, zname)
+            if os.path.exists(xbin) and os.path.exists(zbin):
+                logger.info(f"[mask] grid for {proc}: {xbin} | {zbin}")
+                return xbin, zbin
+        logger.warning(f"[mask] no grid dumps found for {proc} in {base_dirs}")
+        return None, None
+
+
+    def _mask_gradient_near_sr(self, input_path, parameters=None):
+        """
+        Maskiert kombinierte Kernel in `input_path` pro Partition (proc).
+        Vor dem Maskieren wird jede Kerneldatei auf die procspezifische Modell-Länge
+        (OUTPUT_FILES_INIT) gecroppt, damit SPECFEM-konforme Längen garantiert sind.
+        Nutzt für die Top-Layer-Maske einen GLOBALEN z_top (aus output/MODEL_INIT),
+        damit innere Partitionen NICHT versehentlich als "Oberfläche" gemutet werden.
+        """
+        logger.info(f"[mask] ENTER _mask_gradient_near_sr(input_path={input_path}, ext='{self._ext}', cwd={self.cwd}) [IMPLEMENTATION_ID=topfix+precrop+nopad]")
+    
+        if not (getattr(self, "mask_sr", False) or getattr(self, "mask_top_layer", False)
+                or getattr(self, "mask_side_layer", False)
+                or float(getattr(self, "mask_rec_radius_m", 0)) > 0):
+            logger.info("[mask] no masking requested -> early return")
+            return
+    
+        unix.cd(self.cwd)
+    
+        # Parameter sicher auf *_kernel normalisieren
+        if parameters is None:
+            parameters = getattr(self, "_parameters", None) or []
+        parameters = [p if p.endswith("_kernel") else f"{p}_kernel" for p in parameters]
+    
+        # Quelle/Stationen lesen (best effort)
+        try:
+            xs, zs = self._read_source_coords()
+            logger.info(f"[mask] SOURCE coords: xs={xs:.6f}, zs={zs:.6f}")
+        except Exception as e:
+            logger.warning(f"[mask] could not read SOURCE coords: {e}")
+            xs, zs = None, None
+    
+        stations = self._read_station_coords()
+        logger.info(f"[mask] STATIONS: n={len(stations)} (first 3: {stations[:3] if stations else []})")
+        
+        model_init_dir = os.path.join(self.path.output, "MODEL_INIT")
+        z_top_global = _find_global_surface_z(model_init_dir, zs_hint=zs, logger=logger)
+        if z_top_global is not None:
+            logger.info(f"[mask] GLOBAL z_top={z_top_global:.6f} (from {model_init_dir})")
+        else:
+            logger.warning("[mask] GLOBAL z_top could not be determined; top-layer mask will be skipped.")
+
+        x_left_global, x_right_global = _find_global_x_bounds(model_init_dir, logger=logger)
+        if x_left_global is not None:
+            logger.info(f"[mask] GLOBAL x bounds: left={x_left_global:.6f}, right={x_right_global:.6f} "
+                        f"(from {model_init_dir})")
+        else:
+            logger.warning("[mask] GLOBAL x bounds could not be determined; side-layer mask will be skipped.")
+    
+        # Modell-Länge pro Proc/Feld ermitteln (bevorzugt OUTPUT_FILES_INIT)
+        def _target_size_for_proc(proc, par_model):
+            candidates = [
+                os.path.join(self.path._mainsolver, "specfem2d_workdir", "OUTPUT_FILES_INIT",
+                             f"{proc}_{par_model}{self._ext}"),
+                os.path.join(self.cwd, "specfem2d_workdir", "OUTPUT_FILES_INIT",
+                             f"{proc}_{par_model}{self._ext}"),
+                os.path.join(self.path.output, "MODEL_INIT",
+                             f"{proc}_{par_model}{self._ext}"),
+            ]
+            sizes = []
+            for pth in candidates:
+                if pth and os.path.exists(pth):
+                    try:
+                        sizes.append(os.path.getsize(pth) // 4)  # float32
+                    except OSError:
+                        pass
+            return min(sizes) if sizes else None
+    
+        total_files = masked_files = 0
+        missing_grids = []
+    
+        # Fester Pfad zu OUTPUT_FILES_INIT fürs Precrop
+        try:
+            model_dir_precrop = Path(self.path._mainsolver) / "specfem2d_workdir" / "OUTPUT_FILES_INIT"
+        except Exception:
+            model_dir_precrop = Path(self.cwd) / "specfem2d_workdir" / "OUTPUT_FILES_INIT"
+    
+        for par in parameters:
+            # alle Kernel-Dateien zu diesem Parameter einsammeln
+            kfiles = []
+            for pat in self._kernel_file_patterns(input_path, par):
+                kfiles.extend(sorted(glob(pat)))
+            if not kfiles:
+                logger.warning(f"[mask] par={par}: no kernel files matched (ext='{self._ext}') -> skip")
+                continue
+    
+            par_model = par.replace("_kernel", "")
+    
+            for kfile in kfiles:
+                total_files += 1
+                basename = os.path.basename(kfile)
+                proc = basename.split("_")[0]  # 'proc000123'
+                logger.info(f"[mask] par={par} {proc}: kfile={kfile}")
+    
+                # --- vorab Dateilänge sicherstellen (gegen Model croppen) ---
+                try:
+                    _crop_kernel_to_model_size(
+                        kfile,
+                        model_dir=model_dir_precrop,
+                        dtype="float32",
+                        backup=False,
+                        logger=logger,
+                    )
+                except Exception as e:
+                    logger.warning(f"[mask] par={par} {proc}: precrop failed -> {e}")
+    
+                # Grids suchen
+                xbin, zbin = self._find_grid_bins(proc)
+                logger.debug(f"[mask] grids for {proc}: xbin={xbin} zbin={zbin}")
+                if not (xbin and zbin):
+                    missing_grids.append(proc)
+                    continue
+    
+                # x/z lesen (Fortran-Binary-aware: entfernt Record-Marker korrekt)
+                try:
+                    x = read_fortran_binary(xbin)
+                    z = read_fortran_binary(zbin)
+                except Exception as e:
+                    logger.warning(f"[mask] par={par} {proc}: failed reading x/z -> {e}")
+                    continue
+                if x.size != z.size:
+                    logger.warning(f"[mask] par={par} {proc}: x/z size mismatch {x.size} vs {z.size} -> skip")
+                    continue
+
+                # Kernel lesen (Fortran-Binary-aware, nach Precrop)
+                try:
+                    k = read_fortran_binary(kfile)
+                except Exception as e:
+                    logger.warning(f"[mask] par={par} {proc}: failed reading kernel -> {e}")
+                    continue
+    
+                # procspezifische Zielgröße
+                target_size = _target_size_for_proc(proc, par_model)
+                if target_size is None:
+                    target_size = k.size
+                    logger.warning(f"[mask] {par} {proc}: no model size found -> using kernel size={target_size}")
+    
+                # Längen angleichen: immer nur croppen (kein Padding!)
+                n = min(x.size, z.size, k.size, target_size)
+                if (x.size, z.size, k.size) != (n, n, n) or n != target_size:
+                    logger.info(f"[mask] {par} {proc}: align sizes x/z/k/target -> {x.size}/{z.size}/{k.size}/{target_size} -> {n}")
+                x = x[:n]; z = z[:n]; k = k[:n]  # nur kürzen
+    
+                # Maske bauen
+                w = np.ones_like(k, dtype=np.float32)
+    
+                # Quellen-Maske
+                if xs is not None and float(self.mask_src_radius_m) > 0.0:
+                    w *= self._radial_cosine_taper(
+                        x, z, xs, zs,
+                        r0=float(self.mask_src_radius_m),
+                        rt=float(self.mask_taper_m),
+                    )
+    
+                # Empfänger-Masken
+                if float(self.mask_rec_radius_m) > 0.0 and stations:
+                    for (xr, zr) in stations:
+                        w *= self._radial_cosine_taper(
+                            x, z, xr, zr,
+                            r0=float(self.mask_rec_radius_m),
+                            rt=float(self.mask_taper_m),
+                        )
+    
+                # Top-Layer-Maske mit GLOBALER Oberfläche
+                if getattr(self, "mask_top_layer", False) and float(self.mask_top_thickness_m) > 0.0 and (z_top_global is not None):
+                    w *= self._vertical_top_taper(
+                        z=z,
+                        z_top=float(z_top_global),
+                        thick=float(self.mask_top_thickness_m),
+                        taper=float(self.mask_top_taper_m),
+                    )
+
+                # Side-Layer-Maske (links/rechts) mit GLOBALEN Modellraendern
+                if getattr(self, "mask_side_layer", False) and float(self.mask_side_thickness_m) > 0.0 and (x_left_global is not None):
+                    w *= self._horizontal_side_taper(
+                        x=x,
+                        x_left=float(x_left_global),
+                        x_right=float(x_right_global),
+                        thick=float(self.mask_side_thickness_m),
+                        taper=float(self.mask_side_taper_m),
+                    )
+
+                # Statistik & Anwendung
+                frac_taper = float((w < 1.0).sum()) / float(w.size) if w.size else 0.0
+                logger.info(f"[mask] {par} {proc}: weight stats min={w.min():.3f} mean={w.mean():.3f} "
+                            f"max={w.max():.3f} muted={frac_taper*100:.1f}%")
+    
+                before = float(np.linalg.norm(k)) if k.size else 0.0
+                k *= w
+                after  = float(np.linalg.norm(k)) if k.size else 0.0
+    
+                try:
+                    write_fortran_binary(k.astype(np.float32), kfile)
+                    masked_files += 1
+                    logger.info(f"[mask] {par} {proc}: |k|2 {before:.3e} -> {after:.3e} | wrote {k.size} floats "
+                                f"(Fortran-Binary mit Record-Markern)")
+                except Exception as e:
+                    logger.warning(f"[mask] {par} {proc}: write failed -> {e}")
+                    continue
+    
+        # Nachlauf / Fehlerberichte
+        if missing_grids:
+            procs = ", ".join(sorted(set(missing_grids)))
+            raise RuntimeError(f"[mask] Missing x/z grid bins for procs: {procs}")
+    
+        logger.info(f"[mask] EXIT _mask_gradient_near_sr: total={total_files}, masked={masked_files}")
+        if masked_files == 0:
+            logger.warning("[mask] completed but masked_files == 0 (no files written)")
+
+##################################################################
+
 
     def smooth(self, input_path, output_path, parameters=None, span_h=None,
-               span_v=None, use_gpu=False):
+               span_v=None, use_gpu=None):
         """
         Wrapper for SPECFEM smoothing binaries: 
         xsmooth_sem, xsmooth_sem_pde, xsmooth_laplacian_sem
@@ -954,6 +1971,27 @@ class Specfem:
         :param use_gpu: whether to use GPU acceleration for smoothing. Requires
             GPU compiled binaries and GPU compute node.
         """ 
+        # PATCH MAX--- begin: guard to ensure per-proc sizes match before processing ---
+        from pathlib import Path
+        
+        # Guard: pro-Proc Kernel auf Modellgröße trimmen
+        model_dir = Path(self.cwd) / "specfem2d_workdir" / "OUTPUT_FILES_INIT"
+        pars = parameters or self._parameters
+        
+        for par in pars:
+            par_tag = par if par.endswith("_kernel") else f"{par}_kernel"
+            for kfile in sorted(Path(input_path).glob(f"proc??????_{par_tag}{self._ext}")):
+                _crop_kernel_to_model_size(
+                    str(kfile),
+                    model_dir=model_dir,
+                    dtype="float32",
+                    backup=True,
+                    logger=logger
+                )
+        # 
+
+
+
         unix.cd(self.cwd)
 
         # Assign some default parameters from class attributes if not given
@@ -973,11 +2011,13 @@ class Specfem:
         # Ensure trailing '/' character, required by xsmooth_sem
         input_path = os.path.join(input_path, "")
         output_path = os.path.join(output_path, "")
+        if use_gpu is None:
+            use_gpu = self.smooth_use_gpu
         if use_gpu:
             use_gpu = ".true"
         else:
             use_gpu = ".false"
-
+            
         # Determine which smoothing function we are using
         if self.smooth_type.lower() == "gaussian":  # 2D/3D/3D_GLOBE
             cmd = "bin/xsmooth_sem"
@@ -1001,6 +2041,16 @@ class Specfem:
         # will not recognize
         files = glob(os.path.join(output_path, "*"))
         unix.rename(old="_smooth", new="", names=files)
+
+        ####PATCH MAX: lokal begrenztes Smoothing um Void-Waende####
+        buffer_m = getattr(self, "local_void_smooth_buffer_m", 0.0)
+        if buffer_m and buffer_m > 0:
+            _blend_local_void_smoothing(
+                input_path=input_path, output_path=output_path,
+                parameters=parameters, ext=self._ext,
+                buffer_m=buffer_m, logger=logger
+            )
+        #### PATCH MAX ####
 
     def _run_binary(self, executable, stdout="solver.log", with_mpi=True):
         """

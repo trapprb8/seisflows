@@ -124,7 +124,19 @@ class Pyaflowa:
                  path_preprocess=None, path_solver=None, path_data=None,
                  path_output=None, obs_data_format="SAC",
                  syn_data_format="ASCII", data_case="data", components=None,
-                 start=None, ntask=1, nproc=1, source_prefix=None, **kwargs):
+                 start=None, ntask=1, nproc=1, source_prefix=None,
+                 # >>> NEU PATCH MAX:
+                 window_starttime=None, window_endtime=None,
+                 # --- Geometry-Fensterung (optional) ---
+                 win_mode=None,              # 'off' | 'absolute' | 'relative_t0'
+                 t0_source=None,             # 'geometry'
+                 vp_ref=None,                # m/s
+                 t0_add_s=None,              # globaler Zeitoffset (s)
+                 dt_start_s=None,            # Start relativ t0 (s)
+                 dt_end_s=None,              # Ende relativ t0 (s)
+                 win_taper_frac=None,        # 0..1
+                 **kwargs):
+
         """
         Pyatoa preprocessing parameters
 
@@ -159,6 +171,22 @@ class Pyaflowa:
         :param path_data: path to any externally stored data required by the 
             solver
         """
+        
+        #NEU PATCH MAX
+        self.window_starttime = window_starttime  # in Sekunden relativ zum ersten Sample
+        self.window_endtime   = window_endtime    # in Sekunden relativ zum ersten Sample
+        #########
+        # --- PATCH MAX - WINDOWING ---
+        # --- Geometry-t0 Windowing (Defaults = None, damit YAML übersichtlich bleibt) ---
+        self.win_mode       = (win_mode or "off").lower()  # 'off' bewahrt FULLTRACE-Verhalten
+        self.t0_source      = None if t0_source is None else str(t0_source).lower()
+        
+        self.vp_ref         = None if vp_ref         is None else float(vp_ref)
+        self.t0_add_s       = None if t0_add_s       is None else float(t0_add_s)
+        self.dt_start_s     = None if dt_start_s     is None else float(dt_start_s)
+        self.dt_end_s       = None if dt_end_s       is None else float(dt_end_s)
+        self.win_taper_frac = None if win_taper_frac is None else float(win_taper_frac)
+        ##########################################
         # Pyatoa related parameters
         self.min_period = min_period
         self.max_period = max_period
@@ -226,7 +254,7 @@ class Pyaflowa:
         self._syn_acceptable_data_formats = ["ASCII"]
         self._acceptable_source_prefixes = ["SOURCE", "FORCESOLUTION",
                                             "CMTSOLUTION"]
-        self._acceptable_fix_windows = ["ITER", "ONCE", True, False]
+        self._acceptable_fix_windows = ["ITER", "ONCE", "FULLTRACE", True, False]
 
         # Internal bookkeeping attributes to be filled in by self.setup()
         self._inv = None
@@ -251,6 +279,33 @@ class Pyaflowa:
         for key in ["standardize", "preprocess", "window"]:
             assert(key in self.preproc_toggles), \
                 f"Pyaflowa `preproc_toggles` missing key {key}"
+
+        # --- sanity checks für Windowing ---
+        if self.win_mode == "relative_t0":
+            # Quelle der t0-Schätzung: aktuell nur 'geometry' vorgesehen
+            assert self.t0_source in ["geometry"], \
+                f"t0_source must be 'geometry' for win_mode='relative_t0' (got {self.t0_source!r})"
+        
+            # Pflicht-Parameter müssen gesetzt sein (keine None mehr erlaubt)
+            for name, val in [
+                ("vp_ref",         self.vp_ref),
+                ("dt_start_s",     self.dt_start_s),
+                ("dt_end_s",       self.dt_end_s),
+                ("win_taper_frac", self.win_taper_frac),
+            ]:
+                assert val is not None, f"{name} must be set for win_mode='relative_t0'"
+        
+            assert self.vp_ref > 0.0, "vp_ref must be > 0.0 m/s"
+            assert self.dt_end_s > self.dt_start_s, \
+                f"dt_end_s ({self.dt_end_s}) must be > dt_start_s ({self.dt_start_s})"
+            assert 0.0 <= self.win_taper_frac < 1.0, \
+                f"win_taper_frac ({self.win_taper_frac}) must be in [0,1)"
+        
+            # t0_add_s darf optional None sein → dann 0.0 verwenden
+            if self.t0_add_s is None:
+                self.t0_add_s = 0.0
+
+
 
     def setup(self):
         """
@@ -288,6 +343,110 @@ class Pyaflowa:
             iteration and step count
         """
         return f"{config.event_id}_{config.iter_tag}{config.step_tag}"
+
+    ########### PATCH MAX - WINDOWING ##############
+    def _parse_specfem2d_stations(self, stations_fid):
+        """
+        Robust für 2D-STATIONS:
+        Spalten können (STA, NET, X, Z, ..) oder (NET, STA, X, Z, ..) sein.
+        X/Z in Metern erwartet.
+        """
+        mp = {}  # (net, sta) -> (x, z)
+        if not os.path.isfile(stations_fid):
+            return mp
+        with open(stations_fid, "r") as fr:
+            for line in fr:
+                s = line.strip().split()
+                if len(s) < 4:
+                    continue
+                # Erkennen, ob s[0],s[1] textuell sind
+                def _isfloat(tok):
+                    try:
+                        float(tok); return True
+                    except Exception:
+                        return False
+                # zwei Varianten: (STA, NET, X, Z) oder (NET, STA, X, Z)
+                if not _isfloat(s[0]) and not _isfloat(s[1]) and _isfloat(s[2]) and _isfloat(s[3]):
+                    sta, net, x, z = s[0], s[1], float(s[2]), float(s[3])
+                elif not _isfloat(s[0]) and not _isfloat(s[1]) and _isfloat(s[2]):
+                    # fallback
+                    sta, net, x, z = s[0], s[1], float(s[2]), float(s[3])
+                else:
+                    # (NET, STA, X, Z)
+                    net, sta, x, z = s[0], s[1], float(s[2]), float(s[3])
+                mp[(net, sta)] = (x, z)
+        return mp
+    
+    def _parse_specfem2d_source(self, source_fid):
+        """
+        Liest xs/zs (m) + optional tshift aus SPECFEM2D SOURCE/CMTSOLUTION/FORCESOLUTION.
+        Robust gegen Fortran-Zahlen (…d0 / …D+03) und unterschiedliche Zeilenformate.
+        """
+        import re
+    
+        xs = zs = None
+        tshift = 0.0
+        if not os.path.isfile(source_fid):
+            return xs, zs, tshift
+    
+        # Zahl mit optionalem Exponent, erlaubt d/D anstelle von e/E
+        num = re.compile(r'([-+]?\d+(?:\.\d+)?(?:[eEdD][+-]?\d+)?|\d+(?:\.\d+)?)')
+    
+        def _grab_float(line):
+            m = num.search(line)
+            if not m:
+                return None
+            s = m.group(1).replace('D', 'e').replace('d', 'e')
+            try:
+                return float(s)
+            except Exception:
+                return None
+    
+        with open(source_fid, "r") as fr:
+            for raw in fr:
+                low = raw.lower()
+                # xs
+                if ("x_source" in low) or re.match(r'^\s*xs\b', low):
+                    val = _grab_float(raw)
+                    if val is not None:
+                        xs = float(val)
+                # zs
+                if ("z_source" in low) or re.match(r'^\s*zs\b', low):
+                    val = _grab_float(raw)
+                    if val is not None:
+                        zs = float(val)
+                # optionaler Zeitversatz
+                if any(k in low for k in ["t0", "tshift", "time_shift", "time shift"]):
+                    val = _grab_float(raw)
+                    if val is not None:
+                        tshift = float(val)
+    
+        return xs, zs, tshift
+
+    
+    def _geometry_t0_seconds(self, event_id, net, sta):
+        """
+        t0 aus Geometrie: Distanz/ vp_ref + t0_add_s (+ optional SOURCE-tshift).
+        """
+        stations_fid = os.path.join(self.path.solver, event_id, "DATA", "STATIONS")
+        mp = getattr(self, "_stations_cache", None)
+        if mp is None or getattr(self, "_stations_cache_fid", "") != stations_fid:
+            mp = self._parse_specfem2d_stations(stations_fid)
+            self._stations_cache = mp
+            self._stations_cache_fid = stations_fid
+    
+        source_fid = os.path.join(self.path.solver, event_id, "DATA", self._source_prefix)
+        xs, zs, tshift_src = self._parse_specfem2d_source(source_fid)
+    
+        if xs is None or zs is None or (net, sta) not in mp:
+            return None  # kein t0 möglich
+    
+        xi, zi = mp[(net, sta)]
+        dist = float(((xi - xs) ** 2 + (zi - zs) ** 2) ** 0.5)  # m
+        t0 = dist / max(self.vp_ref, 1e-9) + float(self.t0_add_s) + float(tshift_src)
+        return max(t0, 0.0)
+ #######################################################   
+
 
     def quantify_misfit(self, source_name=None, save_residuals=None,
                         export_residuals=None, save_adjsrcs=None,
@@ -338,6 +497,7 @@ class Pyaflowa:
         config.event_id = source_name
         config.iteration = iteration
         config.step_count = step_count
+        config.fix_windows = self.fix_windows
         if components is not None:
             config.component_list = components
 
@@ -348,15 +508,25 @@ class Pyaflowa:
 
         # Process each pair in serial.
         if _serial:
-            total_misfit, total_windows = 0, 0
+            total_misfit, total_windows, total_raw_misfit = 0, 0, 0.0
             for o, s in zip(obs, syn):
-                misfit, nwin = self._quantify_misfit_single(o, s, config,
+                misfit, nwin, raw = self._quantify_misfit_single(o, s, config,
                                                             save_adjsrcs)
 
                 total_misfit += misfit or 0
                 total_windows += nwin or 0
+                total_raw_misfit += raw or 0.0
         # Process each pair in parallel. Max workers is total num. of cores
         else:
+            # Pre-fetch cartopy Natural Earth data single-threaded to prevent
+            # concurrent workers from corrupting the downloaded shapefiles
+            if self.plot_waveforms:
+                try:
+                    import cartopy.io.shapereader as shpreader
+                    shpreader.natural_earth(resolution='10m', category='physical',
+                                           name='coastline')
+                except Exception:
+                    pass
             with ProcessPoolExecutor(max_workers=unix.nproc()) as executor:
                 futures = [
                     executor.submit(self._quantify_misfit_single, o, s, config,
@@ -365,15 +535,50 @@ class Pyaflowa:
             wait(futures)
 
             # Initialize empty values to store statistics on entire misfit quant
-            total_misfit, total_windows = 0, 0
+            total_misfit, total_windows, total_raw_misfit = 0, 0, 0.0
             for future in futures:
-                misfit, nwin = future.result()
+                misfit, nwin, raw = future.result()
 
                 total_misfit += misfit or 0
                 total_windows += nwin or 0
+                total_raw_misfit += raw or 0.0
 
         logger.info(f"{source_name}; misfit={total_misfit:.2E}; "
                     f"number of windows={total_windows}")
+
+        # --- PATCH: klassischen (un-normierten) Misfit persistent speichern ---
+        # Es werden ZWEI Werte pro Quelle geloggt:
+        #   s_j_raw   = total_raw_misfit = 0.5*Integral(syn-obs)^2 dt auf den
+        #               ROHEN (standardisiert, ungefiltert/ungetapert) Spuren.
+        #               -> KONSISTENT mit der Forward-Nachrechnung
+        #               (compute_misfit_curve.py) und step2 (roh). DIES ist die
+        #               Groesse fuer die Publikationskurve. Wird waehrend der
+        #               Inversion berechnet -> keine teure Nachrechnung noetig
+        #               (wichtig fuer 3D!).
+        #   s_j_filt  = total_misfit = Pyadjoints Misfit auf den gefilterten/
+        #               gefensterten Spuren (das, was die Inversion minimiert).
+        #               Nur als Cross-Check.
+        # Rein additives Logging - die eigentliche Inversion ist NICHT betroffen.
+        try:
+            _cm_file = os.path.join(self.path.output, "classical_misfit.txt")
+            if not os.path.exists(_cm_file):
+                # Header nur einmal, race-sicher via exklusivem Anlegen ('x')
+                try:
+                    with open(_cm_file, "x") as _f:
+                        _f.write("# iteration step_count source_name "
+                                 "s_j_raw(=0.5*int_diff^2_dt_roh) "
+                                 "s_j_filtered n_windows\n")
+                except FileExistsError:
+                    pass
+            # Eine kurze Zeile pro Quelle -> atomarer Append (POSIX, < PIPE_BUF),
+            # damit parallele Sigma-/Quellprozesse sich nicht ins Gehege kommen.
+            with open(_cm_file, "a") as _f:
+                _f.write(f"{iteration} {step_count} {source_name} "
+                         f"{total_raw_misfit:.6e} {total_misfit:.6e} "
+                         f"{total_windows}\n")
+        except Exception as _e:
+            logger.warning(f"[classical_misfit] konnte Wert nicht speichern: {_e}")
+        # --- ENDE PATCH ---
 
         # Save residuals to external file for Workflow to calculate misfit `f`
         # Slightly different than Default preprocessing because we need to
@@ -530,7 +735,15 @@ class Pyaflowa:
         )
         station_logger.info(_msg)
 
-        # If any part of this processing fails for whatever reason, move on to 
+        # --- PATCH: klassischer ROHER Misfit (fuer konsistente Publikationskurve).
+        # Wird unten aus st_obs_raw/st_syn_raw berechnet (standardisiert=zeitlich
+        # aligniert, aber UNgefiltert/UNgetapert). Das ist exakt dieselbe Basis wie
+        # die Forward-Nachrechnung (compute_misfit_curve.py) und wie step2 (roh):
+        #   s = 1/2 * Integral (syn - obs)^2 dt   pro Kanal, hier ueber die
+        # Kanaele dieses Paares summiert. Default 0.0, falls Verarbeitung scheitert.
+        raw_misfit = 0.0
+
+        # If any part of this processing fails for whatever reason, move on to
         # plotting and don't let it affect the other tasks
         try:
             if self.preproc_toggles.standardize:
@@ -540,6 +753,23 @@ class Pyaflowa:
             # ASDFDataSet because we don't want to save processed versions
             st_obs_raw = mgmt.st_obs.copy()
             st_syn_raw = mgmt.st_syn.copy()
+
+            # --- PATCH: rohen Misfit auf den standardisierten, UNgefilterten
+            # Spuren berechnen (Trapez-Integration, wie compute_misfit_curve.py).
+            try:
+                for _tr_syn in st_syn_raw:
+                    _sel = st_obs_raw.select(component=_tr_syn.stats.component)
+                    if not _sel:
+                        continue
+                    _d_syn = _tr_syn.data
+                    _d_obs = _sel[0].data
+                    _n = min(len(_d_syn), len(_d_obs))
+                    _dt = float(_tr_syn.stats.delta)
+                    _diff = _d_syn[:_n] - _d_obs[:_n]
+                    raw_misfit += 0.5 * float(np.trapz(_diff * _diff, dx=_dt))
+            except Exception as _e:
+                station_logger.warning(f"[classical_misfit raw] Berechnung "
+                                       f"fehlgeschlagen: {_e}")
 
             # Filter waveforms
             if self.preproc_toggles.preprocess:
@@ -573,9 +803,190 @@ class Pyaflowa:
                             # same time
                             time.sleep(random.random())
                     del ds
+
+            # ---PATCH MAX: MANUELLES WINDOWING: relative t0 aus Geometrie ---
+            if (self.preproc_toggles.window
+                and self.win_mode == "relative_t0"
+                and self.t0_source == "geometry"):
+            
+                from pyflex.window import Window
+            
+                windows = {}
+                # Komponenten aus tatsächlichen Spuren ableiten (robust)
+                comps = sorted({tr.stats.component for tr in mgmt.st_obs})
+            
+                n_overridden = 0
+                for comp in comps:
+                    trsel = mgmt.st_obs.select(component=comp)
+                    if not trsel:
+                        continue
+                    tr = trsel[0]
+                    n  = tr.stats.npts
+                    dt = tr.stats.delta
+            
+                    net = getattr(tr.stats, "network", "")
+                    sta = getattr(tr.stats, "station", "")
+            
+                    t0 = self._geometry_t0_seconds(config.event_id, net, sta)
+                    station_logger.info(f"[geom] net.sta={net}.{sta} t0={None if t0 is None else t0*1e3:.3f} ms "
+                    f"n={n} dt={dt*1e6:.1f} µs")
+                    if t0 is None:
+                        continue  # keine Geometrie -> kein Fenster
+            
+                    # Start/Ende relativ zu t0
+                    wstart = t0 + float(self.dt_start_s)
+                    wend   = t0 + float(self.dt_end_s)
+            
+                    # in Sample-Indizes (inkl. Clipping) umrechnen
+                    left_idx  = max(0,            int(np.floor(wstart / dt)))
+                    right_idx = min(n - 1,        int(np.ceil (wend   / dt)))
+                    
+                    station_logger.info(f"[geom-win] {net}.{sta}.{comp} idx=[{left_idx},{right_idx}] "
+                    f"t_start={(left_idx*dt):.6f}s t_end={(right_idx*dt):.6f}s")
+                    
+                    if right_idx <= left_idx:
+                        continue  # leeres/ungültiges Fenster
+            
+                    # Fensterobjekt erstellen
+                    w = Window(
+                        left=left_idx,
+                        right=right_idx,
+                        center=(left_idx + right_idx) // 2,
+                        time_of_first_sample=tr.stats.starttime,
+                        dt=dt,
+                        min_period=mgmt.config.min_period,
+                        channel_id=f"{tr.stats.network}.{tr.stats.station}..{tr.stats.channel}",
+                    )
+                    # für Plot/Annos
+                    w.max_cc_value = 1.0
+                    w.cc_shift = 0
+                    w.dlnA = 0.0
+            
+                    # Taper-Fraktion (Pyflex wertet die Grenzen; Cosine-Taper sitzt in AdjSrc)
+                    # Wir speichern sie im Window-Objekt als Meta (Pyflex nutzt 'taper_percentage')
+                    try:
+                        w.taper_percentage = float(self.win_taper_frac)
+                    except Exception:
+                        pass
+            
+                    windows.setdefault(comp, []).append(w)
+                    n_overridden += 1
+            
+                if windows:
+                    mgmt.windows = windows
+                    mgmt.stats.nwin = sum(len(v) for v in windows.values())
+                    station_logger.info(
+                        f"[manual-window geometry] event={config.event_id} "
+                        f"vp_ref={self.vp_ref:.1f} m/s, dt_start={self.dt_start_s*1e3:.2f} ms, "
+                        f"dt_end={self.dt_end_s*1e3:.2f} ms, taper={self.win_taper_frac:.2f}, "
+                        f"assigned_windows={mgmt.stats.nwin}"
+                    )
+                else:
+                    station_logger.warning("[manual-window geometry] no windows assigned; falling back to existing windows")
+
+            ########################################################################################################
                     
             # Calculate adjoint source
+            
+                        # --- FULLTRACE in genau den Fällen, wo wir es brauchen -----------------------
+            # Aktiv, wenn:
+            #   - cfg.fix_windows == "FULLTRACE"   (explizit), ODER
+            #   - windowing global aus ist, ODER
+            #   - Pyflex 0 Fenster gefunden hat
+            from pyflex.window import Window
+            
+            cfg = mgmt.config
+            ### Patch Max logger
+            logger.info("[win-debug] win_mode=%s t0_source=%s preproc_window=%s "
+            "cfg.fix_windows=%s nwin_after_manual=%s",
+            self.win_mode, self.t0_source, self.preproc_toggles.window,
+            str(getattr(cfg, "fix_windows", "")),
+            str(getattr(mgmt.stats, "nwin", None)))
+
+            want_fulltrace = (
+                str(getattr(cfg, "fix_windows", "")).upper() == "FULLTRACE"
+                or not self.preproc_toggles.window
+                or getattr(mgmt.stats, "nwin", 0) == 0
+            )
+            
+            ############ PATCH MAX FULLTRACE STARTTIME ENDTIME
+            if want_fulltrace:
+                windows = {}
+                # Komponenten aus Config, sonst aus tatsächlichen Spuren ableiten
+                comps = list(getattr(cfg, "components", "") or "")
+                if not comps:
+                    comps = sorted({tr.stats.component for tr in mgmt.st_obs})
+            
+                # Custom-Zeiten NUR verwenden, wenn FULLTRACE EXPLIZIT gesetzt ist
+                custom_bounds_allowed = (str(getattr(cfg, "fix_windows", "")).upper() == "FULLTRACE")
+            
+                for comp in comps:
+                    trsel = mgmt.st_obs.select(component=comp)
+                    if not trsel:
+                        continue
+                    tr = trsel[0]
+                    n  = tr.stats.npts
+                    dt = tr.stats.delta
+            
+                    # Default: ganze Spur
+                    left_idx, right_idx = 0, n - 1
+            
+                    # Falls explizit FULLTRACE UND Zeiten gesetzt: in Indizes umrechnen
+                    if custom_bounds_allowed and (self.window_starttime is not None or self.window_endtime is not None):
+                        wstart = 0.0 if self.window_starttime is None else float(self.window_starttime)
+                        wend   = (n - 1) * dt if self.window_endtime is None else float(self.window_endtime)
+            
+                        # in Sample-Indizes (inkl. Clipping) umrechnen
+                        left_idx  = max(0,            int(np.floor(wstart / dt)))
+                        right_idx = min(n - 1,        int(np.ceil (wend   / dt)))
+            
+                        # Falls ungültig, auf Vollspur zurückfallen
+                        if right_idx <= left_idx:
+                            left_idx, right_idx = 0, n - 1
+                            logger.warning("window_starttime/window_endtime ergaben ein leeres Fenster – falle auf Vollspur zurück.")
+            
+                    w = Window(
+                        left=left_idx, right=right_idx, center=(left_idx + right_idx)//2,
+                        time_of_first_sample=tr.stats.starttime, dt=dt,
+                        min_period=cfg.min_period,
+                        channel_id=f"{tr.stats.network}.{tr.stats.station}..{tr.stats.channel}",
+                    )
+                    # Dummy-Werte für Plot/Annos
+                    w.max_cc_value = 1.0
+                    w.cc_shift = 0
+                    w.dlnA = 0.0
+            
+                    windows[comp] = [w]
+            
+                if windows:
+                    mgmt.windows = windows
+                    mgmt.stats.nwin = sum(len(v) for v in windows.values())
+                    logger.info("FULLTRACE → %d Fenster (Vollspur) für %s", mgmt.stats.nwin, ",".join(windows.keys()))
+
+                    if custom_bounds_allowed and (self.window_starttime is not None or self.window_endtime is not None):
+                        logger.info("FULLTRACE (custom) → %d Fenster [%gs, %gs] für %s",
+                                    mgmt.stats.nwin,
+                                    0.0 if self.window_starttime is None else self.window_starttime,
+                                    (n - 1) * dt if self.window_endtime is None else self.window_endtime,
+                                    ",".join(windows.keys()))
+                    else:
+                        logger.info("FULLTRACE → %d Fenster (Vollspur) für %s",
+                                    mgmt.stats.nwin, ",".join(windows.keys()))
+            # PATCH MAX ENDE --------------------------------------------------------------------------
+            
+            from pyatoa.utils import form as _form
+            import pyatoa.core.manager as _mgr
+            _orig = _form.channel_code
+            def _safe(dt):
+                try:
+                    return _orig(dt)
+                except Exception:
+                    return "B"   # immer 'B' erzwingen
+            _form.channel_code = _safe
+            _mgr.channel_code  = _safe
+            
             mgmt.measure()
+            
         except Exception as e:
             station_logger.critical(f"FLOW FAILED:")
             # Get the full traceback and push to logger
@@ -623,7 +1034,7 @@ class Pyaflowa:
 
                 time.sleep(_wait)
 
-        return mgmt.stats.misfit, mgmt.stats.nwin
+        return mgmt.stats.misfit, mgmt.stats.nwin, raw_misfit
 
     def finalize(self):
         """
@@ -636,76 +1047,62 @@ class Pyaflowa:
         insp = Inspector()
         insp.discover(path=self.path._datasets)
         insp.save(path=self.path._preproc_output)
-
-        # Move scratch/ directory results into more permanent storage. Do not
-        # bomb out datasets because we use them to store window information
+    
+        # Move datasets/CSVs
         if self.export_datasets:
             src = glob(os.path.join(self.path._datasets, "*.h5"))
-            src += glob(os.path.join(self.path._datasets, "*.csv"))  # inspector
+            src += glob(os.path.join(self.path._datasets, "*.csv"))
             dst = os.path.join(self.path._preproc_output, "datasets", "")
             unix.mkdir(dst)
             unix.cp(src, dst)
-
-        # Organize waveform figures for easier navigability. Only do this if we
-        # are going to export otherwise theres no point
+    
+        # Organize waveform figures
         if self.plot_waveforms and self.export_figures:
-            # Determine the available evaluation tags
             evaluations = []
-            # Expected fmt: <source_name>_<evaluation>_<tag>.pdf
             for fid in glob(os.path.join(self.path._figures, "*_i??s??*.pdf")):
                 for part in os.path.basename(fid).split(".")[0].split("_"):
-                    # Slightly hacky, expecting that eval is the only tag in the
-                    # filename that matches the format i?????
-                    if part.startswith("i") and len(part) == 6:  # i??s??
+                    if part.startswith("i") and len(part) == 6:
                         if part not in evaluations:
                             evaluations.append(part)
-
-            # Move every evaluation into its own directory for easier navi. 
+    
             for eval_ in set(evaluations):
                 dst = os.path.join(self.path._figures, eval_)
                 src = glob(os.path.join(self.path._figures, f"*_{eval_}*.pdf"))
                 unix.mkdir(os.path.join(self.path._figures, eval_))
                 unix.mv(src, dst)
-
-            # Save figure files to output (if requested)
+    
             src = glob(os.path.join(self.path._figures, "i??s??"))
             dst = os.path.join(self.path._preproc_output, "figures", "")
             unix.mkdir(dst)
             unix.mv(src, dst)
-
-            # Bomb out the scratch directory since we exported
+    
             unix.rm(self.path._figures)
             unix.mkdir(self.path._figures)
-
-        # Save log files to output (if requested)
+    
+        # Move logs
         if self.export_log_files:
-            # Determine the available evaluation tags
             evaluations = []
-            # Expected fmt: <source_name>_<evaluation>_<tag>.log
             for fid in glob(os.path.join(self.path._logs, "*_i??s??*.log")):
                 for part in os.path.basename(fid).split(".")[0].split("_"):
-                    # Slightly hacky, expecting that eval is the only tag in the
-                    # filename that matches the format i?????
-                    if part.startswith("i") and len(part) == 6:  # i??s??
+                    if part.startswith("i") and len(part) == 6:
                         if part not in evaluations:
                             evaluations.append(part)
-
-            # Move every evaluation into its own directory for easier navi. 
+    
             for eval_ in set(evaluations):
                 dst = os.path.join(self.path._logs, eval_)
                 src = glob(os.path.join(self.path._logs, f"*_{eval_}*.log"))
                 unix.mkdir(os.path.join(self.path._logs, eval_))
                 unix.mv(src, dst)
-
+    
             src = glob(os.path.join(self.path._logs, "i??s??"))
             dst = os.path.join(self.path._preproc_output, "logs", "")
             unix.mkdir(dst)
             unix.mv(src, dst)
-
-            # Bomb out the log files scratch directory since we exported
+    
             unix.rm(self.path._logs)
             unix.mkdir(self.path._logs)
             unix.mkdir(os.path.join(self.path._logs, "tmp"))
+
 
     def _check_fixed_windows(self, iteration, step_count):
         """

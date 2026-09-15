@@ -1,15 +1,16 @@
 name: seisflows
 channels:
-    - conda-forge
+  - conda-forge
 dependencies:
-    - pip
-    - numpy<2.0.0  # requires PyASDF update
-    - obspy
-    - cartopy
-    - pyyaml
-    - pypdf
-    - pip:
-      - pyatoa
+  - python=3.9
+  - obspy
+  - cartopy
+  - pyyaml
+  - "pypdf<4"
+  - spyder=6.0.4
+  - pip
+  - pip:
+      - git+https://github.com/adjtomo/pyatoa.git
       - pysep-adjtomo
-      - -e .
+      - .
 

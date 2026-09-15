@@ -174,56 +174,6 @@ class Migration(Forward):
             your kernels may be zero due to something going awry in the
             misfit quantification or adjoint simulations.
         """
-        def mask_source_event_kernels(**kwargs):
-            """
-            Mask source region by combining binary source mask with kernel.
-            This feature is only available in SPECFEM3D_GLOBE and only turned on
-            if solver.mask_source is set to True, otherwise it will be skipped.
-
-            This uses the Model class because SPECFEM does not have an internal
-            function for multiplying files (only for adding/subtracting)
-            """
-            # Only trigger this function if the Solver saved source mask files
-            mask_path = os.path.join(self.path.eval_grad, "mask_source", 
-                                     self.solver.source_names[0])
-            if not glob(os.path.join(mask_path, "*")):
-                logger.debug("no source mask files found, skipping source mask")
-                return
-            
-            logger.info("masking source region in event kernels")
-            for src in self.solver.source_names:
-                logger.debug(f"mask source {src}")
-                path = os.path.join(self.path.eval_grad, "mask_source", src)
-
-                # Mask vector [0, 1], where values <1 are near source
-                mask_model = Model(path=path, parameters=["mask_source"],
-                                   regions=self.solver._regions)
-                
-                # Gaussian mask sometimes does not sufficiently suppress source 
-                # region so we modify the amplitude 
-                maskv = mask_model.vector
-                if self.solver.scale_mask_region:
-                    logger.info(f"scaling source mask by "
-                                f"{self.solver.scale_mask_region}")
-                    maskv[maskv < 1] *= self.solver.scale_mask_region  
-
-                # Need to expand vector the length of the event kernel vector
-                maskv = np.tile(maskv, len(self.solver._parameters))
-                
-                # Now we apply the mask to the event kernel which contains all
-                # parameters we are updating in our inversion
-                event_kernel = Model(
-                    path=os.path.join(self.path.eval_grad, "kernels", src), 
-                    parameters=[f"{par}_kernel" for par in 
-                                self.solver._parameters],
-                    regions=self.solver._regions
-                    )
-                event_kernel.update(vector=event_kernel.vector * maskv)
-
-                # Overwrite existing event kernel files with the masked version
-                event_kernel.write(
-                    path=os.path.join(self.path.eval_grad, "kernels", src)
-                    )
 
         def combine_event_kernels(**kwargs):
             """
@@ -246,6 +196,21 @@ class Migration(Forward):
                 parameters=parameters
             )
 
+### PATCH MAX####
+
+        def mask_misfit_kernel(**kwargs):
+            """
+            Maskiere die zusammengefassten (misfit) Kernel in-place,
+            bevor smoothing läuft.
+            """
+            logger.info("masking misfit kernel around sources/receivers and top layer")
+            self.solver._mask_gradient_near_sr(
+                input_path=os.path.join(self.path.eval_grad, "misfit_kernel"),
+                parameters=[f"{par}_kernel" for par in self.solver._parameters],
+            )
+##############
+
+
         def smooth_misfit_kernel(**kwargs):
             """
             Smooth the misfit kernel using the underlying Solver smooth function
@@ -267,18 +232,18 @@ class Migration(Forward):
                 )
 
         # Make sure were in a clean scratch eval_grad directory
-        tags = ["misfit_kernel", "mk_nosmooth"]
-        for tag in tags:
-            scratch_path = os.path.join(self.path.eval_grad, tag)
-            if os.path.exists(scratch_path):
-                shutil.rmtree(scratch_path)
+        #tags = ["misfit_kernel", "mk_nosmooth"]
+        #for tag in tags:
+        #    scratch_path = os.path.join(self.path.eval_grad, tag)
+         #   if os.path.exists(scratch_path):
+         #       shutil.rmtree(scratch_path)
 
         # NOTE: May need to increase the tasktime by a factor of n because the
         # smoothing operation is computational expensive; add the following:
         # tasktime=self.system.tasktime * 2  # increase 2 if you need more time
-        self.system.run([mask_source_event_kernels, combine_event_kernels, 
-                         smooth_misfit_kernel], single=True,
-                         tasktime=self.system.tasktime * 1)
+        self.system.run([combine_event_kernels,
+                         mask_misfit_kernel, smooth_misfit_kernel],
+                        single=True, tasktime=self.system.tasktime * 1)
 
     def evaluate_gradient_from_kernels(self):
         """
@@ -291,6 +256,12 @@ class Migration(Forward):
         """
         # Check that kernel files exist before attempting to manipulate
         misfit_kernel_path = os.path.join(self.path.eval_grad, "misfit_kernel")
+        #PATCH MAX#
+        import os as _os
+        from glob import glob as _glob
+        logger.debug(f"[eval] cwd={_os.getcwd()} eval_grad={self.path.eval_grad}")
+        logger.debug(f"[eval] misfit check path={misfit_kernel_path}")
+        logger.debug(f"[eval] misfit count={len(_glob(_os.path.join(misfit_kernel_path,'*')))}")
         if not glob(os.path.join(misfit_kernel_path, "*")):
             logger.critical(msg.cli(
                 "directory 'scratch/eval_grad/misfit_kernel' is empty but "

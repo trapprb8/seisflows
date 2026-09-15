@@ -228,7 +228,52 @@ def sfparser():
                         help="colormap to be passed to PyPlot")
     plot2d.add_argument("-s", "--savefig", type=str, nargs="?", default=None,
                         help="optional name and path to save figure")
+                        
+      # PATCH VON MAX  # --- overlay sources/receivers ---
+    # --- overlay sources/receivers ---
+    plot2d.add_argument("--plot_sr", action="store_true", default=False,
+                        help="overlay sources (rot) & receivers (grün)")
+    plot2d.add_argument("--sr_src_size", type=float, default=36.0,
+                        help="Markergröße Quelle (matplotlib s)")
+    plot2d.add_argument("--sr_rec_size", type=float, default=20.0,
+                        help="Markergröße Empfänger (matplotlib s)")
+    plot2d.add_argument("--sr_data", type=str, default=None,
+                        help="Pfad zu SPECFEM DATA/, überschreibt path_specfem_data")
+
+                      
     # =========================================================================
+  
+  # PATCH VON MAX
+        # =========================================================================
+    plot2d_truemodel = subparser.add_parser(
+        "plot2d_truemodel", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""Plots model/kernels/gradient files located in the output/
+        directory. ONLY available for SPECFEM2D models.""",
+        help="Plot 2D figures of models/kernels/gradients")
+
+    plot2d_truemodel.add_argument("name", type=str, nargs="?",
+                        help="Name of directory in the output/ directory")
+    plot2d_truemodel.add_argument("parameter", type=str, nargs="?",
+                        help="Name of parameter to plot from `name`. E.g., 'vs', "
+                             "'vp' etc.")
+    plot2d_truemodel.add_argument("-c", "--cmap", type=str, nargs="?",
+                        help="colormap to be passed to PyPlot")
+    plot2d_truemodel.add_argument("-s", "--savefig", type=str, nargs="?", default=None,
+                        help="optional name and path to save figure")
+    
+    # --- overlay sources/receivers ---
+    plot2d_truemodel.add_argument("--plot_sr", action="store_true", default=False,
+                                  help="overlay sources (rot) & receivers (grün)")
+    plot2d_truemodel.add_argument("--sr_src_size", type=float, default=36.0,
+                                  help="Markergröße Quelle (matplotlib s)")
+    plot2d_truemodel.add_argument("--sr_rec_size", type=float, default=20.0,
+                                  help="Markergröße Empfänger (matplotlib s)")
+    plot2d_truemodel.add_argument("--sr_data", type=str, default=None,
+                                  help="Pfad zu SPECFEM DATA/, überschreibt path_specfem_data")
+    
+    # =========================================================================
+    
+    
     plotst = subparser.add_parser(
         "plotst", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""Plots waveforms output by the solver. Uses ObsPy's 
@@ -355,10 +400,12 @@ working state before the workflow can be resumed
                           )
     # =========================================================================
     # Defines all arguments/functions that expect a sub-argument
-    subparser_dict = {"check": check, "par": par,
-                      "sempar": sempar, "clean": clean, "plot2d": plot2d,
-                      "restart": restart, "print": print_, "reset": reset,
-                      "examples": examples, "swap": swap}
+    subparser_dict = {
+        "check": check, "par": par, "sempar": sempar, "clean": clean,
+        "plot2d": plot2d, "plot2d_truemodel": plot2d_truemodel,   # <-- HINZU
+        "restart": restart, "print": print_, "reset": reset,
+        "examples": examples, "swap": swap
+    }
     if parser.parse_args().command in subparser_dict:
         return parser, subparser_dict[parser.parse_args().command]
     else:
@@ -409,6 +456,71 @@ class SeisFlows:
         if parameter_file is not None:
             self._args.parameter_file = parameter_file
 
+####################PATCH MAX######################
+    def _read_sr_coords(self, sr_data_dir=None):
+        """
+        Lese Quellen- und Empfängerkoordinaten aus SPECFEM2D DATA/-Dateien.
+        - Receiver: STATIONS (Spalten: net sta x z ...)
+        - Sources: alle Dateien *SOURCE*
+        Rückgabe: (xs, zs, xr, zr) als Listen (x horizontal, z vertikal)
+        """
+        import os, re, glob
+        # DATA-Verzeichnis bestimmen
+        data_dir = None
+        if sr_data_dir:
+            data_dir = sr_data_dir
+        else:
+            # Versuch: aus parameters.yaml -> path_specfem_data
+            try:
+                from seisflows.tools.specfem import getpar
+                _, data_dir, _ = getpar(key="path_specfem_data",
+                                        file=self._args.parameter_file, delim=":")
+            except Exception:
+                pass
+        if not data_dir:
+            data_dir = os.path.join(os.getcwd(), "specfem2d_workdir", "DATA")
+
+        xs, zs, xr, zr = [], [], [], []
+
+        # Empfänger: STATIONS
+        stafile = os.path.join(data_dir, "STATIONS")
+        if os.path.exists(stafile):
+            with open(stafile, "r") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    parts = ln.split()
+                    # i.d.R. x,z an Index 2,3
+                    try:
+                        xr.append(float(parts[2]))
+                        zr.append(float(parts[3]))
+                    except Exception:
+                        # fallback: letzte zwei Positionsspalten
+                        try:
+                            xr.append(float(parts[-4]))
+                            zr.append(float(parts[-3]))
+                        except Exception:
+                            continue
+
+        # Quellen: *SOURCE*
+        for sf in glob.glob(os.path.join(data_dir, "*SOURCE*")):
+            try:
+                txt = open(sf, "r", encoding="utf-8", errors="ignore").read()
+            except Exception:
+                continue
+            mx = re.search(r"^\s*xs\s*=\s*([0-9eE+\-\.]+)", txt, re.M)
+            mz = re.search(r"^\s*zs\s*=\s*([0-9eE+\-\.]+)", txt, re.M)
+            if mx and mz:
+                try:
+                    xs.append(float(mx.group(1)))
+                    zs.append(float(mz.group(1)))
+                except Exception:
+                    pass
+
+        return xs, zs, xr, zr
+
+##########################################################################
     def __call__(self, command=None, **kwargs):
         """
         When called, SeisFlows will execute one of its internal functions
@@ -1226,8 +1338,167 @@ class SeisFlows:
         plot_model = Model(path=os.path.join(output_dir, name))
         plot_model.coordinates = base_model.coordinates
         # plot2d has internal check for acceptable parameter value
-        plot_model.plot2d(parameter=parameter, cmap=cmap, show=True,
-                          title=f"{name} // {parameter}", save=savefig)
+        ##############PATCH MAX SR PLOTTEN #########################
+        # Erst zeichnen, aber noch nicht speichern/anzeigen:
+        plot_model.plot2d(parameter=parameter, cmap=cmap, show=False,
+                          title=f"{name} // {parameter}", save=None)
+        
+        # Optional: Sender/Empfänger überlagern
+        # --- SR Overlay -------------------------------------------------------------
+        # --- SR Overlay -------------------------------------------------------------
+        if getattr(self._args, "plot_sr", False):
+            import matplotlib.pyplot as plt
+            from matplotlib.ticker import MultipleLocator, FormatStrFormatter
+        
+            sr_data  = getattr(self._args, "sr_data", None)
+            src_size = float(getattr(self._args, "sr_src_size", 36.0))
+            rec_size = float(getattr(self._args, "sr_rec_size", 20.0))
+            xs, zs, xr, zr = self._read_sr_coords(sr_data_dir=sr_data)
+        
+            ax = plt.gca()
+            fig = plt.gcf()
+        
+            # Punkte GENAU an den angegebenen Koordinaten zeichnen (keine Offsets!)
+            # clip_on=False: Marker dürfen am Rand überstehen, werden aber nicht abgeschnitten.
+            if xs and zs:
+                ax.scatter(xs, zs, s=src_size, c="red",   marker="o",
+                           clip_on=False, zorder=10, linewidths=0, edgecolors="none")
+            if xr and zr:
+                ax.scatter(xr, zr, s=rec_size, c="green", marker="o",
+                           clip_on=False, zorder=10, linewidths=0, edgecolors="none")
+        
+            # Damit die dicken Achsenspine die Marker nicht übermalen:
+            for spine in ax.spines.values():
+                spine.set_zorder(0)
+        
+            # Titel minimal höher (ohne das Datenbild zu verändern)
+            try:
+                ax.set_title(ax.get_title(), pad=12)  # ~2–4 mm je nach DPI
+            except Exception:
+                pass
+        
+            # Z-Achse: 1 m Raster, integer Labels (generisch für beliebige Modellhöhe)
+            ax.yaxis.set_major_locator(MultipleLocator(1.0))
+            ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
+        
+        
+                
+        # Jetzt speichern oder anzeigen
+        import matplotlib.pyplot as plt
+        if savefig:
+            plt.savefig(savefig, dpi=300, bbox_inches="tight")
+            plt.close()
+        else:
+            plt.show()
+                          
+     ### PATCH VON MAX ####
+                          
+    def plot2d_truemodel(self, name=None, parameter=None, cmap=None, savefig=None, **kwargs):
+        """
+        Plot model/gradient/kernel aus `path_output/name`, wobei die 2D-Koordinaten
+        **aus MODEL_TRUE** übernommen werden (statt MODEL_INIT).
+        Achtung: Das funktioniert nur zuverlässig, wenn `name == "MODEL_TRUE"`
+        oder `name` auf derselben Diskretisierung liegt wie MODEL_TRUE.
+        """
+        import os
+        import sys
+        from glob import glob
+        from seisflows.tools.specfem import getpar
+        from seisflows.tools import msg
+        from seisflows.tools.model import Model
+    
+        # Wo liegen die Outputs?
+        _, output_dir, _ = getpar(
+            key="path_output",
+            file=self._args.parameter_file,
+            delim=":"
+        )
+    
+        # Welche Namen kann man plotten?
+        acceptable_names = sorted([
+            os.path.basename(p) for p in glob(os.path.join(output_dir, "*_*"))
+        ])
+    
+        if name is None:
+            print(msg.cli(
+                "Available models/gradients/kernels",
+                items=acceptable_names,
+                header="Plot2D (TRUE-coords)"
+            ))
+            sys.exit(0)
+        else:
+            assert name in acceptable_names, (
+                f"`seisflows plot2d_truemodel` kann nur {acceptable_names} plotten, "
+                f"aber bekam '{name}'. Existiert es in {output_dir}?"
+            )
+    
+        # Koordinaten aus MODEL_TRUE
+        base_true = Model(path=os.path.join(output_dir, "MODEL_TRUE"))
+        assert base_true.coordinates is not None, (
+            "`MODEL_TRUE` hat keine 2D-Koordinaten. "
+            "Lege MODEL_TRUE im path_output an und kopiere proc*_x.bin / proc*_z.bin hinein."
+        )
+    
+        # Werte aus Zielverzeichnis
+        target = os.path.join(output_dir, name)
+        plot_model = Model(path=target)
+        plot_model.coordinates = base_true.coordinates
+    
+        # Plotten (Parameter-Check passiert in Model.plot2d)
+        # Erst zeichnen, aber noch nicht speichern/anzeigen:
+        ################PATCH MAX SR PLOT ##################
+        plot_model.plot2d(
+            parameter=parameter,
+            cmap=cmap,
+            show=False,
+            title=f"{name} // {parameter} (TRUE coords)",
+            save=None
+        )
+        
+        # --- SR Overlay -------------------------------------------------------------
+        if getattr(self._args, "plot_sr", False):
+            import matplotlib.pyplot as plt
+            from matplotlib.ticker import MultipleLocator, FormatStrFormatter
+        
+            sr_data  = getattr(self._args, "sr_data", None)
+            src_size = float(getattr(self._args, "sr_src_size", 36.0))
+            rec_size = float(getattr(self._args, "sr_rec_size", 20.0))
+            xs, zs, xr, zr = self._read_sr_coords(sr_data_dir=sr_data)
+        
+            ax = plt.gca()
+            fig = plt.gcf()
+        
+            # Punkte GENAU an den angegebenen Koordinaten zeichnen (keine Offsets!)
+            # clip_on=False: Marker dürfen am Rand überstehen, werden aber nicht abgeschnitten.
+            if xs and zs:
+                ax.scatter(xs, zs, s=src_size, c="red",   marker="o",
+                           clip_on=False, zorder=10, linewidths=0, edgecolors="none")
+            if xr and zr:
+                ax.scatter(xr, zr, s=rec_size, c="green", marker="o",
+                           clip_on=False, zorder=10, linewidths=0, edgecolors="none")
+        
+            # Damit die dicken Achsenspine die Marker nicht übermalen:
+            for spine in ax.spines.values():
+                spine.set_zorder(0)
+        
+            # Titel minimal höher (ohne das Datenbild zu verändern)
+            try:
+                ax.set_title(ax.get_title(), pad=12)  # ~2–4 mm je nach DPI
+            except Exception:
+                pass
+        
+            # Z-Achse: 1 m Raster, integer Labels (generisch für beliebige Modellhöhe)
+            ax.yaxis.set_major_locator(MultipleLocator(1.0))
+            ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
+        
+        # Jetzt speichern oder anzeigen
+        import matplotlib.pyplot as plt
+        if savefig:
+            plt.savefig(savefig, dpi=300, bbox_inches="tight")
+            plt.close()
+        else:
+            plt.show()
+
 
     def reset(self, choice=None, **kwargs):
         """

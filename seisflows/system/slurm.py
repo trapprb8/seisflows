@@ -28,6 +28,7 @@ import sys
 import numpy as np
 import time
 import subprocess
+import shlex
 
 from seisflows import logger
 from seisflows.system.cluster import Cluster
@@ -72,9 +73,19 @@ class Slurm(Cluster):
         self.slurm_args = slurm_args
 
         # Must be overwritten by child class
-        self.partition = None
-        self.submit_to = None
-        self._partitions = {}
+        ########### PATCH MAX
+        # respektiere ggf. bereits gesetzte Werte und fülle Partitionstabelle
+        self.partition  = getattr(self, "partition", None) or kwargs.get("partition")
+        self.submit_to  = getattr(self, "submit_to", None) or kwargs.get("submit_to") or self.partition
+        self._partitions = getattr(self, "_partitions", None) or kwargs.get("_partitions") or {
+            "short": 40, "medium": 40, "long": 40, "fatnodes": 40
+        }
+        # Fallback: wenn partition noch leer, nimm default-Partition / erste
+        if not self.partition:
+            self.partition = "short" if "short" in self._partitions else sorted(self._partitions)[0]
+        if not self.submit_to:
+            self.submit_to = self.partition
+        ####################
 
         # Define SLURM-dependent job states used for monitoring queue
         # Available job states are listed here: 
@@ -142,52 +153,85 @@ class Slurm(Cluster):
         ])
         return _call
 
+########### patch MAX##########
+########### patch MAX ##########
     def run_call(self, executable="", single=False, array=None, tasktime=None):
+        import shlex, os, sys  # <— sys & os sicherstellen
+    
         """
         The run call defines the SBATCH call which is used to run tasks during
         an executing workflow. Like the submit call its arguments are dictated
         by the given system. Run calls are modified and called by the `run`
         function
-
-        :type executable: str
-        :param exectuable: the actual exectuable to run within the SBATCH 
-            directive. Something like './script.py'
-        :type array: str
-        :param array: overwrite the `array` variable to run specific jobs. If
-            not provided, then we will run jobs 0-{ntask}%{ntask_max}. Jobs 
-            should be submitted in the format of a SLURM array string, 
-            something like: 0,1,3,5 or 2-4,8-22
-        :type single: bool
-        :param single: flag to get a run call that is meant to be run on the
-            mainsolver (ntask==1), or run for all jobs (ntask times). Examples
-            of single process runs include smoothing, and kernel combination
-        :rtype: str
-        :return: the system-dependent portion of a run call
         """
-        array = array or self.task_ids(single=single)  # get job array str
-        tasktime = tasktime or self.tasktime  # allow override of tasktime
-
-        # Determine if this is a single-process or array job
+        array = array or self.task_ids(single=single)      # get job array str
+        tasktime = tasktime or self.tasktime               # allow override
+    
+        # SLURM-Array vs. Single-Task: SEISFLOWS_TASKID nur bei single setzen
         if single:
-            env = "SEISFLOWS_TASKID=0," 
+            env = "SEISFLOWS_TASKID=0,"
         else:
             env = ""
-        
+    
+        # Bisherige Environment-CSV (kommt aus self.environs), plus TASKID bei single
+        env_str = f"{env}{self.environs or ''}".strip(",")
+    
+        # --- NEU: PATH & LD_LIBRARY_PATH zuverlässig mitgeben (für den Fall, dass run_funcs die Env ersetzt)
+        extra = []
+        for key in ("PATH", "LD_LIBRARY_PATH"):
+            val = os.environ.get(key)
+            if val:
+                # Kommas escapen, da CSV
+                val = val.replace(",", r"\,")
+                extra.append(f"{key}={val}")
+        if extra:
+            env_str = (env_str + "," if env_str else "") + ",".join(extra)
+    
+        # Wir starten das Python-Entry als Modul
+        py = shlex.quote(sys.executable)
+        run_entry = f"{py} -u -m seisflows.system.runscripts.run_funcs"
+    
+        # Das 'executable' kommt aus run(): "<self.run_functions> --funcs <P> --kwargs <Q>"
+        # Prefix entfernen, falls vorhanden, sodass nur die Optionen bleiben
+        suffix = executable
+        if getattr(self, "run_functions", None) and suffix.startswith(self.run_functions):
+            suffix = suffix[len(self.run_functions):].lstrip()
+    
+        # "-e" nur anhängen, wenn es wirklich etwas gibt
+        e_opt = f" -e {shlex.quote(env_str)}" if env_str else ""
+    
+        # --- NEU: Modul-Prelude im Job laden (damit mpirun im PATH ist)
+        prelude = (
+            "source /etc/profile.d/modules.sh 2>/dev/null || true; "
+            "module purge; "
+            "module load intel/2018; "
+            "module load mpi/openmpi4-x86_64; "
+        )
+    
+        # Gesamtes Kommando, das innerhalb von bash -lc läuft
+        wrapped_cmd = f"{prelude}{run_entry} {suffix}{e_opt}"
+    
+        # Sauberes Quoting des kompletten Kommandos
+        wrap = f'--wrap="bash -lc {shlex.quote(wrapped_cmd)}"'
+    
+        # SBATCH-Aufruf (mit --export=ALL als guter Default)
         _call = " ".join([
-             f"sbatch",
-             f"{self.slurm_args or ''}",
-             f"--job-name={self.title}",
-             f"--nodes={self.nodes}",
-             f"--ntasks-per-node={self.node_size:d}",
-             f"--ntasks={self.nproc:d}",
-             f"--time={tasktime}",
-             f"--output={os.path.join(self.path.log_files, '%A_%a')}",
-             f"--array={array}",
-             f"--parsable",
-             f"{executable}",  # <-- The actual script/program to run goes here
-             f"--environment {env}{self.environs or ''}"
+            "sbatch",
+            "--export=ALL",
+            f"{self.slurm_args or ''}",
+            f"--job-name={self.title}",
+            f"--nodes={self.nodes}",
+            f"--ntasks-per-node={self.node_size:d}",
+            f"--ntasks={self.nproc:d}",
+            f"--time={tasktime}",
+            f"--output={os.path.join(self.path.log_files, '%A_%a')}",
+            f"--array={array}",
+            f"--parsable",
+            wrap
         ])
         return _call
+
+###########
 
     @staticmethod
     def _stdout_to_job_id(stdout):

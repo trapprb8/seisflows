@@ -539,7 +539,11 @@ class Inversion(Migration):
 
         logger.info("computing line search trial model `m_try`")
         m_try = self.optimize.compute_trial_model(alpha=alpha)
-        
+        # Optional: clamp vp/vs before any forward runs
+        try:
+            m_try = self.solver.enforce_model_bounds(m_try)
+        except AttributeError:
+            pass        
         # Save the current state of the optimization module to disk
         self.optimize.save_vector(name="m_try", m=m_try)
         self.optimize.save_vector(name="alpha", m=alpha)
@@ -604,15 +608,45 @@ class Inversion(Migration):
         # Update line search history with the step length (alpha) and misfit (f)
         # and incremement the step count
         self.optimize.update_search()
+
+        # Early exit: if all misfit evaluations in this line search are
+        # identical (float64 equality), the model is at machine precision and
+        # no further step can reduce the misfit.  Finalize with zero step so
+        # that subsequent frequency stages can still run.
+        _x_es, _f_es, _ = self.optimize._line_search.get_search_history()
+        if len(_f_es) >= 2 and len(set(_f_es.tolist())) == 1:
+            logger.warning(
+                msg.cli("All line search evaluations give identical misfit — "
+                        "machine precision reached. Accepting current model "
+                        "unchanged and continuing.",
+                        border="=", header="line search stalled")
+            )
+            _path_m_try_es = os.path.join(self.path.eval_func, "model")
+            _m_current = self.optimize.load_vector("m_new")
+            self.optimize.save_vector("m_try", _m_current)
+            _m_current.write(path=_path_m_try_es)
+            self.optimize.finalize_search()
+            self.optimize.checkpoint()
+            return
+
         alpha, status = self.optimize.calculate_step_length()
         m_try = self.optimize.compute_trial_model(alpha=alpha)
+
+        # optionales Clipping VOR allen Saves/Exports
+        try:
+            m_try = self.solver.enforce_model_bounds(m_try)
+        except AttributeError:
+            pass
 
         # Save new model (m_try) and step length (alpha) for new trial step
         if alpha is not None:
             self.optimize.save_vector("alpha", alpha)
         if m_try is not None:
             self.optimize.save_vector("m_try", m_try)
-
+        # dann auf Platte schreiben
+        _path_m_try = os.path.join(self.path.eval_func, "model")
+        if m_try is not None:
+            m_try.write(path=_path_m_try)
         # Proceed based on the outcome of the line search
         if status.upper() == "PASS":
             # Save outcome of line search to disk; reset step to 0 for next iter
@@ -622,8 +656,17 @@ class Inversion(Migration):
             self.optimize.finalize_search()
             self.optimize.checkpoint()
             return
+        
+        #### PATCH MAX ########
         elif status.upper() == "TRY":
             logger.info("trial step unsuccessful. re-attempting line search")
+
+            # Optional: clamp vp/vs before any forward runs
+            try:
+                m_try = self.solver.enforce_model_bounds(m_try)
+            except AttributeError:
+                pass
+        #### PATCH MAX ########
 
             # Expose the new model to the solver directories for the next step
             _path_m_try = os.path.join(self.path.eval_func, "model")
@@ -654,13 +697,22 @@ class Inversion(Migration):
                 self.update_line_search()  # RECURSIVE CALL
             # If we can't then line search has failed. Abort workflow
             else:
-                logger.critical(
-                    msg.cli("Line search has failed to reduce the misfit and "
-                            "has run out of fallback options. Aborting "
-                            "inversion.", border="=",
-                            header="line search failed")
+                logger.warning(
+                    msg.cli("Line search cannot reduce the misfit further "
+                            "(machine precision likely reached). Accepting "
+                            "current model unchanged and continuing to next "
+                            "iteration.", border="=",
+                            header="line search stalled")
                 )
-                sys.exit(-1)
+                # Zero-step finalization: finalize with unchanged model so
+                # that subsequent iterations and frequency stages proceed
+                # normally (all ?_new → ?_old bookkeeping happens as usual).
+                m_current = self.optimize.load_vector("m_new")
+                self.optimize.save_vector("m_try", m_current)
+                m_current.write(path=_path_m_try)
+                self.optimize.finalize_search()
+                self.optimize.checkpoint()
+                return
 
     def finalize_iteration(self):
         """

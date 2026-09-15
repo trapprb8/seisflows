@@ -465,11 +465,15 @@ class Model:
                 logger.warning(f"minimum poisson's ratio out of bounds: "
                                f"{pr.min():.2f} < {min_pr}")
 
-        if "vs" in self.model and np.hstack(self.model.vs).min() < 0:
-            logger.warning(f"Vs minimum is negative {self.model.vs.min()}")
-
-        if "vp" in self.model and np.hstack(self.model.vp).min() < 0:
-            logger.warning(f"Vp minimum is negative {self.model.vp.min()}")
+            if "vs" in self.model:
+                vs_min = min(arr.min() for arr in self.model.vs)  # per-proc min, dann globales min
+                if vs_min < 0:
+                    logger.warning(f"Vs minimum is negative {vs_min}")
+            
+            if "vp" in self.model:
+                vp_min = min(arr.min() for arr in self.model.vp)
+                if vp_min < 0:
+                    logger.warning(f"Vp minimum is negative {vp_min}")
 
     def _check_3dglobe_parameters(self, min_pr=-1., max_pr=0.5):
         """
@@ -516,73 +520,91 @@ class Model:
         elif vector is not None:
             self.model = self.split(vector=vector)
 
-    def plot2d(self, parameter, cmap=None, show=True, title="", save=None):
+    def plot2d(self, parameter, cmap=None, show=True, title="", save=None,
+               mask_cavities=True, cavity_color="white", max_interp_dist=None):
         """
-        Plot internal model parameters as a 2D image plot.
-
-        .. warning::
-            This is only available for SPECFEM2D models. SPECFEM3D model
-            coordinates do not match the model vectors (because the grids are
-            irregular) and cannot be visualized like this.
-
-        :type parameter: str
-        :param parameter: chosen internal parameter value to plot.
-        :type cmap: str
-        :param cmap: colormap which match available matplotlib colormap.
-            If None, will choose default colormap based on parameter choice.
-        :type show: bool
-        :param show: show the figure after plotting
-        :type title: str
-        :param title: optional title to prepend to some values that are
-            provided by default. Useful for adding information about iteration,
-            step count etc.
-        :type save: str
-        :param save: if not None, full path to figure to save the output image
+        ...
+        :type mask_cavities: bool
+        :param mask_cavities: Maskiert Grid-Punkte die zu weit von echten GLL-
+            Punkten entfernt sind (Hohlräume). Standard: True.
+        :type max_interp_dist: float or None
+        :param max_interp_dist: Maximale Distanz in Metern von einem Grid-Punkt
+            zum nächsten GLL-Punkt. Weiter entfernte Punkte gelten als Hohlraum
+            und werden NaN. None = automatisch (2x mittlerer GLL-Abstand).
         """
         assert (parameter in self._parameters), \
             f"chosen `parameter` must be in {self._parameters}"
-
         assert (self.coordinates is not None), (
-            f"`plot2d` function requires model coordinates which are only "
-            f"available for solver SPECFEM2D"
+            "`plot2d` requires model coordinates (SPECFEM2D only)"
         )
-
-        # Choose default colormap based on parameter values
+    
+        zero_midpoint = False
         if cmap is None:
             if "kernel" in parameter:
                 cmap = "seismic_r"
                 zero_midpoint = True
             else:
                 cmap = "Spectral"
-                zero_midpoint = False
-
-        # 'Merge' the coordinate matrices to get a vector representation
-        x, z = np.array([]), np.array([])
-        for iproc in range(self.nproc):
-            x = np.append(x, self.coordinates["x"][iproc])
-            z = np.append(z, self.coordinates["z"][iproc])
-        data = self.merge(parameter=parameter)
-
-        f, p, cbar = plot_2d_image(x=x, z=z, data=data, cmap=cmap,
-                                   zero_midpoint=zero_midpoint)
-
-        # Set some figure labels based on information we know here
+    
+        x = np.hstack(self.coordinates["x"]).astype(float, copy=False)
+        z = np.hstack(self.coordinates["z"]).astype(float, copy=False)
+        data = self.merge(parameter=parameter).astype(float, copy=False)
+    
+        # Duplikate deduplizieren (wie bisher)
+        tol = 1e-8
+        xr = np.round(x / tol).astype(np.int64)
+        zr = np.round(z / tol).astype(np.int64)
+        keys = (xr << 32) | (zr & 0xffffffff)
+    
+        idx = np.argsort(keys)
+        keys = keys[idx]; x = x[idx]; z = z[idx]; data = data[idx]
+    
+        starts = np.r_[0, np.flatnonzero(keys[1:] != keys[:-1]) + 1]
+        ends   = np.r_[starts[1:], len(keys)]
+        counts = (ends - starts)
+    
+        xu = np.add.reduceat(x,    starts) / counts
+        zu = np.add.reduceat(z,    starts) / counts
+        du = np.add.reduceat(data, starts) / counts
+    
+        order = np.lexsort((zu, xu))
+        xu, zu, du = xu[order], zu[order], du[order]
+    
+        # --- Hohlraum-Maske via Nearest-Neighbor-Distanz ---
+        if mask_cavities:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(np.column_stack([xu, zu]))
+    
+            # Automatische Schwelle: 2x mittlerer Abstand zwischen GLL-Punkten
+            if max_interp_dist is None:
+                # Abstand jedes Punktes zu seinem nächsten Nachbarn
+                nn_dist, _ = tree.query(np.column_stack([xu, zu]), k=2)
+                mean_nn = np.median(nn_dist[:, 1])  # Median der NN-Abstände
+                max_interp_dist = 2.0 * mean_nn
+                logger.debug(f"Hohlraum-Schwelle: {max_interp_dist:.2f} m "
+                             f"(2x medianer GLL-Abstand: {mean_nn:.2f} m)")
+    
+        f, p, cbar = plot_2d_image(x=xu, z=zu, data=du, cmap=cmap,
+                                   zero_midpoint=zero_midpoint,
+                                   max_interp_dist=max_interp_dist if mask_cavities else None)
+    
         ax = plt.gca()
         ax.set_xlabel("X [m]")
         ax.set_ylabel("Z [m]")
-        # Allow User to title the figure, e.g., with iteration, step count etc.
-        _title = (f"{parameter.title()}_min = {data.min()};\n"
-                  f"{parameter.title()}_max = {data.max()};\n"
-                  f"{parameter.title()}_mean = {data.mean()}")
+    
+        _title = (f"{parameter.title()}_min = {du.min():.6g};\n"
+                  f"{parameter.title()}_max = {du.max():.6g};\n"
+                  f"{parameter.title()}_mean = {du.mean():.6g}")
         if title:
             _title = f"{title}\n{_title}"
         ax.set_title(_title)
         cbar.ax.set_ylabel(parameter.title(), rotation=270, labelpad=15)
-
+    
         if save:
             plt.savefig(save)
         if show:
             plt.show()
+
 
     def _get_nproc_parameters(self):
         """

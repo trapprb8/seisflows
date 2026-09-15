@@ -26,6 +26,8 @@ from seisflows.tools.specfem import (rename_as_adjoint_source,
 
 from seisflows.plugins.preprocess import misfit as misfit_functions
 from seisflows.plugins.preprocess import adjoint as adjoint_sources
+print(f"[WHOAMI] default.py imported from: {__file__}", flush=True)
+logger.info(f"[WHOAMI] default.py imported from: {__file__}")
 
 
 class Default:
@@ -500,7 +502,11 @@ class Default:
                    origintime=cat[0].preferred_origin().time)
         syn = read(fid=syn_fid, data_format=self.syn_data_format,
                    origintime=cat[0].preferred_origin().time)
-
+        
+        # NEU: Ziel-Länge & -dt vom Roh-Synthetik (Solver) merken
+        target_nstep = int(syn[0].stats.npts)
+        target_dt    = float(syn[0].stats.delta)
+        target_t0    = float(getattr(syn[0].stats, "time_offset", 0.0))
 
         logger.info(f"PREPROCESSING {syn[0].get_id()}")
 
@@ -547,8 +553,46 @@ class Default:
                     obs=tr_obs.data, syn=tr_syn.data,
                     nt=tr_syn.stats.npts, dt=tr_syn.stats.delta
                 )
+                
+                # -- NEU: Länge der Adjoint-Quelle auf NSTEP normieren (Padding/Trim) --
+                nstep = target_nstep
+                adj = np.asarray(adjsrc.data, dtype=float)
+                
+                adj[~np.isfinite(adj)] = 0.0
+
+                if adj.size < nstep:
+                    adj = np.pad(adj, (0, nstep - adj.size), mode="constant")
+                elif adj.size > nstep:
+                    adj = adj[:nstep]
+                
+                adjsrc.data = adj
+                
+                # Header konsistent halten (optional, aber gut)
+                adjsrc.stats.delta = target_dt
+                adjsrc.stats.npts  = nstep
+                adjsrc.stats.time_offset = target_t0
+                # optional, damit alles 100% konsistent ist:
+                adjsrc.stats.starttime = cat[0].preferred_origin().time + target_t0      
+                
+                # numerische Hygiene
+                adj[~np.isfinite(adj)] = 0.0
+                
+                if adj.size < nstep:
+                    # zu kurz -> mit Nullen auffüllen
+                    adj = np.pad(adj, (0, nstep - adj.size), mode="constant")
+                elif adj.size > nstep:
+                    # zu lang -> hart kürzen
+                    adj = adj[:nstep]
+                
+                adjsrc.data = adj
+                # ---------------------------------------------------------------                
+                
+                
                 fid = os.path.basename(syn_fid)
                 fid = rename_as_adjoint_source(fid, fmt=self.syn_data_format)
+                logger.info(f"[ADJLEN] target_nstep={target_nstep} "
+                            f"adj.size={adjsrc.data.size} "
+                            f"dt={adjsrc.stats.delta:.9e} t0={adjsrc.stats.time_offset:.9e}")                
                 write(st=Stream(adjsrc), fid=os.path.join(save_adjsrcs, fid),
                       data_format=self.syn_data_format)
             else:
@@ -679,13 +723,15 @@ def write(st, fid, data_format):
 
     elif data_format.upper() == "ASCII":
         for tr in st:
-            # Time offset should have been set by `read_ascii` when reading in
-            # the original ASCII waveform file
             try:
-                time_offset = tr.stats.time_offset
+                t0 = float(tr.stats.time_offset)
             except AttributeError:
-                time_offset = 0
-            data_out = np.vstack((tr.times() + time_offset, tr.data)).T
+                t0 = 0.0
+            n = tr.data.size
+            dt = float(tr.stats.delta)
+            # explizite Zeitachse: garantiert genau n Punkte
+            t = t0 + np.arange(n, dtype=float) * dt
+            data_out = np.column_stack((t, tr.data.astype(float)))
             np.savetxt(fid, data_out, ["%13.7f", "%17.7f"])
 
 def read_ascii(fid, origintime=None, **kwargs):
