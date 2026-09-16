@@ -1484,13 +1484,17 @@ class Specfem:
             logger.critical(f"xcombine_sem not found or not executable: {exe}")
             sys.exit(1)
     
-        import shutil
-        n_tasks = int(os.environ.get("SLURM_NTASKS", "1"))
-        if shutil.which("mpirun"):      launcher = f"mpirun -n {n_tasks}"    # mpirun bevorzugt
-        elif shutil.which("mpiexec"):   launcher = f"mpiexec -n {n_tasks}"
-        elif shutil.which("srun"):      launcher = f"srun -n {n_tasks}"
+        # PATCH MAX: vorher wurde die Prozessanzahl aus SLURM_NTASKS gelesen
+        # (Default "1"), was auf einem nicht-SLURM-System (z.B. system:
+        # workstation) IMMER 1 ergibt -- unabhaengig vom konfigurierten
+        # `nproc`. xcombine_sem erwartet aber genau so viele Prozesse wie
+        # das Kernel pro Proc aufgeteilt wurde (hier 8). Nutze stattdessen
+        # dieselbe Quelle wie `_run_binary` (self.nproc/self._mpiexec),
+        # damit es auf Workstation UND Cluster konsistent ist.
+        if self._mpiexec:
+            launcher = f"{self._mpiexec} -n {self.nproc}"
         else:
-            logger.critical("No MPI launcher found (srun/mpirun/mpiexec).")
+            logger.critical("No MPI launcher configured (`mpiexec` par).")
             sys.exit(1)
         logger.debug(f"[combine] using MPI launcher: {launcher}")
     

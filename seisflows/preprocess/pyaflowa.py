@@ -135,6 +135,7 @@ class Pyaflowa:
                  dt_start_s=None,            # Start relativ t0 (s)
                  dt_end_s=None,              # Ende relativ t0 (s)
                  win_taper_frac=None,        # 0..1
+                 adj_band_code=None,         # Kanal-Bandcode fuer geschriebene .adj-Dateien
                  **kwargs):
 
         """
@@ -180,6 +181,16 @@ class Pyaflowa:
         # --- Geometry-t0 Windowing (Defaults = None, damit YAML übersichtlich bleibt) ---
         self.win_mode       = (win_mode or "off").lower()  # 'off' bewahrt FULLTRACE-Verhalten
         self.t0_source      = None if t0_source is None else str(t0_source).lower()
+        # PATCH MAX: Bandcode fuer geschriebene .adj-Dateien. `_form.channel_code(dt)`
+        # rekonstruiert einen SEED-Bandcode rein aus der Abtastrate; bei unserer
+        # extrem hohen Abtastrate (dt~8e-08s) schlaegt die SEED-Lookup-Tabelle fehl
+        # und der Fallback griff (Default "B", passend zu CMTSOLUTION/2D-Kanaelen
+        # wie "BXZ"). Unsere 3D-FORCESOLUTION-Quelle erzeugt aber "FXX/FXY/FXZ" --
+        # SPECFEM3D's Adjoint-Solver erwartet .adj-Dateien mit GENAU demselben
+        # Kanalcode wie die Vorwaertssynthetik, sonst liest er (stillschweigend)
+        # Null-Adjointquellen ein -> Nullkernel trotz echtem Misfit. Default "B"
+        # bewahrt 2D-Verhalten; wir setzen "F" explizit in parameters.yaml.
+        self.adj_band_code = (adj_band_code or "B").upper()[:1]
         
         self.vp_ref         = None if vp_ref         is None else float(vp_ref)
         self.t0_add_s       = None if t0_add_s       is None else float(t0_add_s)
@@ -591,8 +602,20 @@ class Pyaflowa:
             else:
                 logger.warning("0 windows found, will not normalize raw misfit")
                 summed_misfit = total_misfit
+            # PATCH MAX: war ".2E" (nur 3 signifikante Stellen). Diese Datei
+            # wird von workflow.inversion.sum_residuals() zurückgelesen, um
+            # den eigentlichen Line-Search-Zielfunktionswert `f_new`/`f_try`
+            # zu bilden. Bei einem vorsichtigen ersten Line-Search-Schritt
+            # (kleine `step_len_init`-skalierte Modelländerung) liegt die
+            # echte Misfit-Aenderung leicht unterhalb dieser 3-stelligen
+            # Aufloesung -> f_new und f_try wurden auf denselben gerundeten
+            # Text abgeschnitten, obwohl Modell und Synthetik sich nachweislich
+            # unterschieden ("LINE SEARCH STALLED" trotz echter Aenderung).
+            # Praezision an die an anderer Stelle im Optimizer bereits
+            # verwendete Konvention angleichen (siehe optimize/gradient.py
+            # ":.16E"-Formatierungen).
             with open(save_residuals, "w") as f:
-                f.write(f"{summed_misfit:.2E}\n")
+                f.write(f"{summed_misfit:.16E}\n")
             if export_residuals:
                 unix.cp(src=save_residuals, dst=export_residuals)
 
@@ -977,11 +1000,12 @@ class Pyaflowa:
             from pyatoa.utils import form as _form
             import pyatoa.core.manager as _mgr
             _orig = _form.channel_code
+            _fallback_band_code = self.adj_band_code
             def _safe(dt):
                 try:
                     return _orig(dt)
                 except Exception:
-                    return "B"   # immer 'B' erzwingen
+                    return _fallback_band_code   # s. adj_band_code (PATCH MAX)
             _form.channel_code = _safe
             _mgr.channel_code  = _safe
             
