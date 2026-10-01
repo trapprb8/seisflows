@@ -432,6 +432,31 @@ class Inversion(Migration):
                 # model, export in SPECFEM format to be discoverable by solver
                 path_model = os.path.join(self.path.eval_grad, "model")
                 m_new = self.optimize.load_vector("m_new")
+                # PATCH MAX: `m_try` wird vor JEDER Line-Search-Auswertung
+                # durch `enforce_model_bounds()` geclampt (siehe
+                # initialize_line_search()/evaluate_line_search_misfit()
+                # weiter unten), `m_new` hier aber bisher NICHT -- obwohl es
+                # exakt dieselbe Referenz ist, gegen die die Line-Search ihre
+                # Akzeptanzentscheidung trifft (f.min() < f[0] in
+                # backtrack.py). Direkt nachgewiesen (2026-09-30, Stufe 2 /
+                # 3kHz, LBFGS-Iteration 2): das rohe, ungeclampte `m_new`
+                # verletzt die Poisson-Ratio-Grenze an 921.640 von 18.75M
+                # Punkten (4.92%) -- d.h. f_new und der alpha->0-Grenzwert von
+                # f_try wurden faktisch an ZWEI VERSCHIEDENEN Modellen
+                # ausgewertet. Symptom: die Backtracking-Line-Search naeherte
+                # sich f_new mit jedem Schritt sauber um den erwarteten
+                # Faktor ~0.5 an (echte lineare Konvergenz, kein Rauschen),
+                # überschritt es aber nie -- weil sie in Wahrheit gegen
+                # misfit(clamp(m_new)) statt misfit(m_new) konvergierte, und
+                # dieser Grenzwert zufällig ueber f_new lag. Fix: `m_new`
+                # hier genauso clampen wie jedes `m_try`, bevor die initiale
+                # Misfit-Auswertung laeuft -- macht f_new mit f_try
+                # vergleichbar und behebt den kuenstlichen "Boden", ohne die
+                # eigentliche Line-Search-Logik zu aendern.
+                try:
+                    m_new = self.solver.enforce_model_bounds(m_new)
+                except AttributeError:
+                    pass
                 m_new.write(path=path_model)
 
                 super().evaluate_initial_misfit(path_model=path_model,

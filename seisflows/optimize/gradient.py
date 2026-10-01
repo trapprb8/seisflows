@@ -70,6 +70,24 @@ class Gradient:
     :type step_len_min: float
     :param step_len_min: optional, minimum allowable step length during the line
         search. Set as a fraction of the current model parameters
+    :type step_len_norm_percentile: float
+    :param step_len_norm_percentile: PATCH MAX -- optional, default None
+        (preserves original behavior: normalize step length by
+        `max(abs(search_direction))`). A single extreme outlier point in the
+        search direction (e.g. an unmasked near-source/receiver singularity)
+        can dominate this max, forcing every trial step to be scaled far too
+        conservatively for the rest of the model -- observed in the 3D
+        foundation-slab project as "clipping saturation": the line search
+        needs many golden-ratio doublings before any point outside the
+        outlier's immediate neighborhood changes meaningfully, while an
+        increasing fraction of the model gets clipped to its bounds along
+        the way. Setting this to e.g. 99.9 normalizes by the 99.9th
+        percentile of |search_direction| instead of the strict max, ignoring
+        the most extreme 0.1% of points when calibrating the step scale.
+        This does NOT alter the search direction/gradient itself (spatial
+        structure, e.g. a diffuse "bubble" signature around a void, is
+        preserved exactly) -- it only changes the scalar used to calibrate
+        how big a step to take.
 
     Paths
     -----
@@ -81,9 +99,9 @@ class Gradient:
     """
     def __init__(self, line_search_method="bracket",
                  preconditioner=None, step_count_max=10, step_len_init=0.01,
-                 step_len_max=0.1, step_len_min=1E-3, workdir=os.getcwd(), 
-                 path_optimize=None, path_output=None, path_preconditioner=None, 
-                 **kwargs):
+                 step_len_max=0.1, step_len_min=1E-3, workdir=os.getcwd(),
+                 path_optimize=None, path_output=None, path_preconditioner=None,
+                 step_len_norm_percentile=None, **kwargs):
         """
         Gradient-descent input parameters.
 
@@ -105,6 +123,8 @@ class Gradient:
         self.step_len_init = step_len_init
         self.step_len_max = step_len_max
         self.step_len_min = step_len_min
+        # PATCH MAX: None -> exact original behavior (max-based norm)
+        self.step_len_norm_percentile = step_len_norm_percentile
 
         # Set required path structure
         self.path = Dict(
@@ -141,6 +161,26 @@ class Gradient:
             line_search_dir, line_search_method.title())(
                                         step_count_max=step_count_max
                                         )
+
+    def _step_len_norm(self, vector):
+        """
+        PATCH MAX: Reference magnitude used to calibrate line search step
+        lengths (see `step_len_norm_percentile` docstring above). Returns
+        the strict max(|vector|) by default (original SeisFlows behavior,
+        exactly preserved for any config that doesn't set
+        `step_len_norm_percentile`). If set, uses that percentile of
+        |vector| instead, so a handful of extreme outlier points (e.g. an
+        unmasked near-source/receiver singularity) don't single-handedly
+        dictate the step scale for the entire model.
+
+        :type vector: np.array
+        :param vector: flat model or search-direction vector
+        :rtype: float
+        :return: reference magnitude for step length calibration
+        """
+        if self.step_len_norm_percentile is None:
+            return max(abs(vector))
+        return float(np.percentile(np.abs(vector), self.step_len_norm_percentile))
 
     def __str__(self):
         """Quickly access underlying line search search history, mostly for
@@ -181,7 +221,10 @@ class Gradient:
         if self.step_len_min is not None and self.step_len_init is not None:
             assert self.step_len_init > self.step_len_min, \
                 f"optimize.step_len_init must be > optimize.step_len_min"
-    
+        if self.step_len_norm_percentile is not None:
+            assert 0. < self.step_len_norm_percentile <= 100., \
+                f"optimize.step_len_norm_percentile must be in (0, 100]"
+
         self._line_search.check()
 
     def setup(self):
@@ -401,10 +444,26 @@ class Gradient:
 
         # Log out the current line search stats for reference
         x, f, idx = self._line_search.get_search_history()
+        # PATCH MAX: `get_search_history()` sortiert x/f nach abs(Schrittlaenge)
+        # AUFSTEIGEND, nicht chronologisch. Das ist fuer eine Bracket-Suche
+        # (Alpha waechst monoton) zufaellig identisch mit der chronologischen
+        # Reihenfolge, aber fuer eine Backtrack-Suche (Alpha wird pro Schritt
+        # HALBIERT) genau umgekehrt: f[-1]/f[-2] blieben dann fuer immer auf
+        # den beiden GROESSTEN bisher versuchten Alphas eingefroren (meist die
+        # ERSTEN beiden Versuche), egal wie viele weitere, kleinere Alphas
+        # danach noch probiert wurden -- beobachtet als exakt identisches
+        # dJ_step ueber mehrere aufeinanderfolgende Line-Search-Schritte einer
+        # Backtrack-Stufe. `idx` behaelt aber die urspruengliche (chronolo-
+        # gische) Einfuegereihenfolge -- damit hier explizit nach `idx`
+        # umsortieren, um den WIRKLICH letzten/vorletzten Versuch zu erhalten.
+        # Betrifft nur dieses Logging (keine andere Stelle nutzt dJ_step/
+        # dJ_tot), die eigentliche Line-Search-Entscheidung ist unberuehrt.
         if len(f) >= 2:
-                dJ_step = f[-1] - f[-2]
-                dJ_tot  = f[-1] - f[0]
-                logger.info(f"dJ_step={dJ_step:.16E}  dJ_total={dJ_tot:.16E}  (rel={dJ_tot/max(abs(f[0]),1e-30):.3E})")
+                chrono = np.argsort(idx)
+                f_chrono = f[chrono]
+                dJ_step = f_chrono[-1] - f_chrono[-2]
+                dJ_tot  = f_chrono[-1] - f_chrono[0]
+                logger.info(f"dJ_step={dJ_step:.16E}  dJ_total={dJ_tot:.16E}  (rel={dJ_tot/max(abs(f_chrono[0]),1e-30):.3E})")
 
         
         idx_str = ", ".join([f"{_:>9}" for _ in idx])   # step count
@@ -451,8 +510,8 @@ class Gradient:
         if self.step_len_init and first_iteration and first_step:
             m = self.load_vector("m_new")  # current model
             p = self.load_vector("p_new")  # current search direction
-            norm_m = max(abs(m.vector))
-            norm_p = max(abs(p.vector))
+            norm_m = self._step_len_norm(m.vector)
+            norm_p = self._step_len_norm(p.vector)
 
             alpha = self.step_len_init * norm_m / norm_p
             status = None
@@ -468,8 +527,8 @@ class Gradient:
         if status == "TRY" and (self.step_len_max or self.step_len_min):
             m = m or self.load_vector("m_new")  # current model
             p = p or self.load_vector("p_new")  # current search direction
-            norm_m = max(abs(m.vector))
-            norm_p = max(abs(p.vector))
+            norm_m = self._step_len_norm(m.vector)
+            norm_p = self._step_len_norm(p.vector)
 
             # Determine minimum alpha as a fraction of the current model
             if self.step_len_min:
@@ -495,15 +554,53 @@ class Gradient:
                     logger.warning(f"`alpha` has exceeded maximum value "
                                    f"{self.step_len_max * 100}%")
                     if first_step:
-                        # If this is the first step, pull back slightly so that 
+                        # If this is the first step, pull back slightly so that
                         # line search can safely increase step length later
                         # TODO: Where does this value come from?
                         alpha = 0.618034 * max_allowable_alpha
                         logger.info("reducing step length for first step")
                     else:
-                        logger.critical(msg.mjr("MAXIMUM STEP LENGTH EXCEEDED, "
-                                                "EXITING WORKFLOW"))
-                        sys.exit(-1)
+                        # PATCH MAX: statt eines harten `sys.exit(-1)` (frueher:
+                        # "MAXIMUM STEP LENGTH EXCEEDED, EXITING WORKFLOW" --
+                        # brach den GESAMTEN Lauf ab) wird jetzt der BESTE
+                        # bisher in dieser Line-Search gefundene Punkt
+                        # akzeptiert (status="PASS"), statt den Lauf komplett
+                        # abzubrechen.
+                        #
+                        # Grund (2026-10-01, Nutzer-Diskussion): `step_len_max`
+                        # klein genug zu setzen, um zu verhindern, dass das
+                        # Modell massenhaft an physikalische Grenzen (vp/vs-
+                        # Bounds, Poisson-Verhaeltnis) stoesst, war mit dem
+                        # alten Verhalten riskant -- wenn das "wahre" Bracket-
+                        # Minimum einen groesseren Schritt braucht als erlaubt,
+                        # waere der GESAMTE Lauf abgestuerzt, statt einfach
+                        # einen kleineren (aber immer noch echt verbessernden)
+                        # Schritt zu akzeptieren. Jeder bereits getestete Punkt
+                        # in der Line-Search-Historie hat per Konstruktion
+                        # f <= f[0] (sonst waere die Bracket-Suche gar nicht
+                        # bis hierher gewachsen, siehe bracket.py
+                        # "all(f <= f[0])"), ist also garantiert eine
+                        # Verbesserung gegenueber `m_new` -- es ist daher immer
+                        # sicher, den bisher besten (niedrigste Misfit)
+                        # gefundenen Punkt zu akzeptieren, statt abzubrechen.
+                        x_hist, f_hist, _ = self._line_search.get_search_history()
+                        idx_best = int(f_hist.argmin())
+                        alpha = float(x_hist[idx_best])
+                        status = "PASS"
+                        # Schrittzaehler dekrementieren, analog zum normalen
+                        # PASS-Pfad in bracket.py/backtrack.py (verhindert,
+                        # dass ein weiterer Schritt gezaehlt wird, der nicht
+                        # mehr ausgefuehrt wird).
+                        self._line_search.step_count -= 1
+                        logger.warning(
+                            f"step length safeguard reached without finding "
+                            f"a proper bracket -- accepting best point found "
+                            f"so far (alpha={alpha:.3E}, "
+                            f"f={f_hist[idx_best]:.6E}) instead of aborting "
+                            f"the workflow"
+                        )
+                        logger.info(f"final accepted step count == "
+                                    f"{self._line_search.step_count}")
 
         if alpha is not None:
             logger.info(f"step length `alpha` = {alpha:.3E}")

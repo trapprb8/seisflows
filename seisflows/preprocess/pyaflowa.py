@@ -766,6 +766,22 @@ class Pyaflowa:
         # Kanaele dieses Paares summiert. Default 0.0, falls Verarbeitung scheitert.
         raw_misfit = 0.0
 
+        # PATCH MAX: sichere Default-Werte VOR dem try-Block. Grund: dieser
+        # try-Block schluckt jede Exception (siehe except unten) und macht
+        # danach mit `pass` weiter -- st_obs_raw/st_syn_raw werden aber erst
+        # INNERHALB des try-Blocks (nach mgmt.standardize()) zugewiesen. Wenn
+        # standardize() selbst scheitert (z.B. AssertionError in
+        # pyatoa.utils.process.trim_streams()), blieben die Variablen
+        # unassigned, und die SPAETERE, ungeschuetzte Verwendung bei
+        # `mgmt.st_obs = st_obs_raw` (siehe unten) stuerzte dann mit einem
+        # zweiten, nicht abgefangenen UnboundLocalError ab, der den ganzen
+        # `seisflows submit`-Prozess (via concurrent.futures) mitriss --
+        # obwohl die urspruengliche Exception eigentlich pro Station
+        # verkraftbar sein sollte. Fallback: unstandardisierte Kopien, damit
+        # ein Fehler in EINER Station nicht den gesamten Lauf crasht.
+        st_obs_raw = mgmt.st_obs.copy()
+        st_syn_raw = mgmt.st_syn.copy()
+
         # If any part of this processing fails for whatever reason, move on to
         # plotting and don't let it affect the other tasks
         try:

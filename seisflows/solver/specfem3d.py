@@ -6,10 +6,14 @@ Specfem3D Cartesian.
 import os
 import time
 from glob import glob
+import numpy as np
 from seisflows import logger
 from seisflows.tools import unix
-from seisflows.tools.specfem import setpar, getpar
-from seisflows.solver.specfem import Specfem
+from seisflows.tools.specfem import setpar, getpar, read_fortran_binary, write_fortran_binary
+from pathlib import Path
+from seisflows.solver.specfem import (Specfem, _crop_kernel_to_model_size,
+                                      _find_global_surface_z,
+                                      _find_global_x_bounds)
 
 
 class Specfem3D(Specfem):
@@ -315,4 +319,393 @@ class Specfem3D(Specfem):
             # e.g., smooth_vp.log
             stdout = f"{self._exc2log(exc)}_{name}.log"
             self._run_binary(executable=exc, stdout=stdout, with_mpi=False)
+
+    # =========================================================================
+    # PATCH MAX (3D): Quelle/Empfaenger-Gradientenmaskierung
+    #
+    # Die geerbte Basisimplementierung `Specfem._mask_gradient_near_sr()`
+    # (seisflows/solver/specfem.py) ist hart auf SPECFEM2D zugeschnitten:
+    #   - liest nur xs/zs aus SOURCE (kein ys)
+    #   - parst STATIONS als "NET STA X Z" (Spalte 3 = Z) -- bei SPECFEM3D ist
+    #     Spalte 3 aber Y, Spalte 5 (bei USE_SOURCES_RECEIVERS_Z) erst Z
+    #   - _find_grid_bins sucht nur proc*_x.bin/proc*_z.bin (kein _y.bin)
+    #   - _radial_cosine_taper rechnet sqrt((x-xc)^2+(z-zc)^2) -- in 3D fehlt
+    #     die Y-Komponente komplett; die Maske waere ein liegender Zylinder
+    #     statt einer Kugel um Quelle/Empfaenger
+    #
+    # Diese Overrides sind NUR in Specfem3D aktiv (Python MRO waehlt sie
+    # automatisch statt der Basisversion) -- Specfem2D/Specfem3DGlobe bleiben
+    # unveraendert. Wiederverwendet werden alle dimensionsunabhaengigen Teile
+    # der Basisklasse: Fortran-Binary-I/O, Kernel-Dateisuche
+    # (_kernel_file_patterns), Kernel-Kroppen auf Modellgroesse
+    # (_crop_kernel_to_model_size) und der Top-Layer-Taper (_vertical_top_taper,
+    # haengt nur von z ab, daher unveraendert korrekt in 3D).
+    #
+    # Seitenrand-Maskierung (mask_side_layer): die 2D-Basisversion
+    # (Specfem._horizontal_side_taper) maskiert nur die x-Achse (2D hat
+    # keine y-Achse) -- fuer 3D rufen wir dieselbe, dimensionsunabhaengige
+    # Funktion zweimal auf (einmal je Achse, x und y) und multiplizieren die
+    # Gewichte, statt eine eigene 4-Flaechen-Variante neu zu schreiben.
+    # Grund, warum das trotz durchgaengig freier Raender
+    # (STACEY_ABSORBING_CONDITIONS=.false. auf allen Seiten) noetig ist:
+    # auch bei physikalisch korrekt konsistenten freien Raendern zeigt der
+    # rohe, unmaskierte Adjoint-Kernel am seitlichen Modellrand eine deutlich
+    # erhoehte Sensitivitaet (Rand-/Kanteneffekt des endlichen Modellgebiets),
+    # unabhaengig vom (separat behandelten) Quelle/Empfaenger-Nahfeld.
+    #
+    # Fuer die Quelle/Empfaenger-Maskierung selbst wird bewusst KEIN reiner
+    # Kugelradius um jeden einzelnen Punkt verwendet, sondern eine duenne
+    # Top-Layer-Maske (mask_top_layer/mask_top_thickness_m, dimensions-
+    # unabhaengig, haengt nur von z ab): da Quelle UND alle Empfaenger auf
+    # derselben Oberflaeche (z=z_top) liegen, deckt eine Schicht alle 81
+    # Punkte gemeinsam ab. Ein Kugelradius muesste, um die Nahfeld-
+    # Singularitaet sicher zu entfernen, so gross gewaehlt werden (~0.15m
+    # Reichweite inkl. Taper), dass er bei unserer duennen Platte (0.3m) und
+    # dem flach liegenden Einschluss (z=0.10-0.20, nur 0.10-0.20m unter der
+    # Oberflaeche) bereits Teile des Einschlusses mit antastet. Eine duenne
+    # Schicht (z.B. 0.05m, reicht bis z_top-0.05m) bleibt dagegen sicher
+    # oberhalb der Einschlusstiefe.
+    # =========================================================================
+
+    def _read_source_coords_3d(self):
+        """
+        xs, ys, zs aus FORCESOLUTION lesen. Setzt voraus:
+        SUPPRESS_UTM_PROJECTION=.true. (latorUTM/longorUTM = x/y in Metern)
+        und USE_SOURCES_RECEIVERS_Z=.true. (depth = absolute z-Koordinate,
+        keine geologische Tiefe unter der Oberflaeche).
+        """
+        # PATCH MAX: FORCESOLUTION trennt Key/Value mit ':' und kommentiert
+        # mit '!' (siehe getpar()-Docstring) -- der Default (delim="=") passt
+        # nur zu Par_file/SOURCE, nicht zu FORCESOLUTION. Ohne explizites
+        # delim=":" schlug getpar() fehl ("not enough values to unpack"),
+        # wodurch die Quellen-Maske nie griff (nur die Empfaenger-Maske lief).
+        srcfile = os.path.join(self.cwd, "DATA", self.source_prefix)
+        xs = float(getpar(key="latorUTM", file=srcfile, delim=":", comment="!")[1])
+        ys = float(getpar(key="longorUTM", file=srcfile, delim=":", comment="!")[1])
+        zs = float(getpar(key="depth", file=srcfile, delim=":", comment="!")[1])
+        return xs, ys, zs
+
+    def _read_station_coords_3d(self):
+        """
+        STATIONS im mainsolver lesen -> Liste [(x, y, z), ...].
+        SPECFEM3D-Format: STA NET X Y ELEVATION BURIAL. Mit
+        USE_SOURCES_RECEIVERS_Z=.true. wird die BURIAL-Spalte (Index 5)
+        direkt als absolute z-Koordinate interpretiert (nicht als Tiefe
+        unter der Oberflaeche) -- analog zur Quelle.
+        """
+        stas = []
+        stfile = os.path.join(self.cwd, "DATA", "STATIONS")
+        if os.path.exists(stfile):
+            with open(stfile, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        try:
+                            x = float(parts[2]); y = float(parts[3])
+                            z = float(parts[5])
+                            stas.append((x, y, z))
+                        except ValueError:
+                            continue
+        return stas
+
+    def _find_grid_bins_3d(self, proc):
+        """
+        Suche x/y/z-Binaergrids fuer einen MPI-Proc. Bevorzugt
+        output/MODEL_INIT (dort exportiert xgenerate_databases die
+        GLL-Punktkoordinaten bei MODEL=gll), faellt sonst auf die
+        klassischen Solver-Pfade zurueck.
+        """
+        # PATCH MAX: `ibool.bin` wird mitgesucht -- ohne sie liegen x/y/z nur
+        # in NGLOB-Aufloesung vor (deduplizierte globale Knoten), waehrend
+        # Kernel/Modell-Dateien in NGLL^3*NSPEC-Aufloesung (pro Element,
+        # mit Duplikaten an Elementgrenzen) stehen. Siehe _mask_gradient_near_sr
+        # fuer die Expansion via ibool.
+        base_dirs = [
+            os.path.join(self.path.output, "MODEL_INIT"),
+            os.path.join(self.cwd, "output", "MODEL_INIT"),
+            os.path.join(self.cwd, "OUTPUT_FILES", "DATABASES_MPI"),
+            os.path.join(self.cwd, self.model_databases),
+        ]
+        for d in base_dirs:
+            xbin = os.path.join(d, f"{proc}_x.bin")
+            ybin = os.path.join(d, f"{proc}_y.bin")
+            zbin = os.path.join(d, f"{proc}_z.bin")
+            ibin = os.path.join(d, f"{proc}_ibool.bin")
+            if (os.path.exists(xbin) and os.path.exists(ybin)
+                    and os.path.exists(zbin) and os.path.exists(ibin)):
+                logger.info(f"[mask-3d] grid for {proc}: {xbin} | {ybin} | "
+                            f"{zbin} | ibool={ibin}")
+                return xbin, ybin, zbin, ibin
+        logger.warning(f"[mask-3d] no grid dumps (incl. ibool) found for "
+                       f"{proc} in {base_dirs}")
+        return None, None, None, None
+
+    @staticmethod
+    def _read_fortran_int32(filename):
+        """
+        Wie `read_fortran_binary`, aber fuer int32-Daten (z.B. `ibool.bin`).
+        Die geteilte `read_fortran_binary`-Funktion liest immer als float32,
+        was fuer ibool (1-indizierte Knotennummern) die rohen Bytes falsch
+        interpretieren wuerde.
+        """
+        nbytes = os.path.getsize(filename)
+        with open(filename, "rb") as f:
+            f.seek(0)
+            n = np.fromfile(f, dtype="int32", count=1)[0]
+            if n == nbytes - 8:
+                f.seek(4)
+                data = np.fromfile(f, dtype="int32")
+                return data[:-1]
+            else:
+                f.seek(0)
+                return np.fromfile(f, dtype="int32")
+
+    @staticmethod
+    def _find_global_y_bounds(model_init_dir, logger=None):
+        """
+        Analog zu `Specfem._find_global_x_bounds` (dort nur x, da 2D keine
+        y-Achse kennt). Liest alle proc??????_y.bin aus model_init_dir und
+        liefert den globalen vorderen/hinteren Modellrand (y_front, y_back).
+        """
+        ymins, ymaxs = [], []
+        for yfile in sorted(Path(model_init_dir).glob("proc??????_y.bin")):
+            try:
+                yy = np.fromfile(yfile, dtype=np.float32)
+            except Exception:
+                continue
+            if yy.size:
+                ymins.append(float(yy.min()))
+                ymaxs.append(float(yy.max()))
+        if not ymins:
+            if logger:
+                logger.warning("[mask-3d] cannot determine global y bounds (no y.bin found)")
+            return None, None
+        y_front, y_back = min(ymins), max(ymaxs)
+        if logger:
+            logger.info(f"[mask-3d] global y bounds: front={y_front:.6f}, back={y_back:.6f}")
+        return y_front, y_back
+
+    def _radial_cosine_taper_3d(self, x, y, z, xc, yc, zc, r0, rt):
+        """
+        3D-Kugel-Distanz-Taper, analog zu `Specfem._radial_cosine_taper`
+        (dort nur 2D/x-z). r0: Voll-Mute-Radius, rt: Taperbreite (additiv).
+        """
+        if r0 <= 0.0:
+            return np.ones_like(x, dtype=np.float32)
+        r = np.sqrt((x - xc) ** 2 + (y - yc) ** 2 + (z - zc) ** 2)
+        w = np.ones_like(r, dtype=np.float32)
+        w[r <= r0] = 0.0
+        if rt > 0.0:
+            m = (r > r0) & (r < (r0 + rt))
+            w[m] = 0.5 * (1.0 - np.cos(np.pi * (r[m] - r0) / rt))
+        return w.astype(np.float32)
+
+    def _mask_gradient_near_sr(self, input_path, parameters=None):
+        """
+        3D-fähige Quelle/Empfaenger- (+ optional Top-Layer-) Maskierung.
+        Ueberschreibt `Specfem._mask_gradient_near_sr` (siehe Modulkommentar
+        oben fuer die Begruendung). Wird von `Specfem.combine()` aufgerufen,
+        wenn `mask_sr` oder `mask_top_layer` gesetzt ist.
+        """
+        logger.info(f"[mask-3d] ENTER _mask_gradient_near_sr(input_path={input_path}, "
+                    f"ext='{self._ext}', cwd={self.cwd})")
+
+        if not (getattr(self, "mask_sr", False) or getattr(self, "mask_top_layer", False)
+                or getattr(self, "mask_side_layer", False)):
+            logger.info("[mask-3d] no masking requested -> early return")
+            return
+
+        unix.cd(self.cwd)
+
+        if parameters is None:
+            parameters = getattr(self, "_parameters", None) or []
+        parameters = [p if p.endswith("_kernel") else f"{p}_kernel" for p in parameters]
+
+        try:
+            xs, ys, zs = self._read_source_coords_3d()
+            logger.info(f"[mask-3d] SOURCE coords: xs={xs:.6f}, ys={ys:.6f}, zs={zs:.6f}")
+        except Exception as e:
+            logger.warning(f"[mask-3d] could not read SOURCE coords: {e}")
+            xs, ys, zs = None, None, None
+
+        stations = self._read_station_coords_3d()
+        logger.info(f"[mask-3d] STATIONS: n={len(stations)} "
+                    f"(first 3: {stations[:3] if stations else []})")
+
+        # model_init_dir: enthaelt proc*_vp.bin/vs.bin, Referenzgroesse fuer
+        # das Kernel-Precrop weiter unten (_crop_kernel_to_model_size).
+        model_init_dir = os.path.join(self.path.output, "MODEL_INIT")
+
+        # PATCH MAX (Bugfix 2026-09-28): `output/MODEL_INIT` enthaelt nur
+        # proc*_vp.bin/vs.bin, KEINE proc*_x/y/z.bin -- die Grenzsuche fand
+        # dort nie etwas, top_layer/side_layer liefen seit ihrer Einfuehrung
+        # unbemerkt komplett leer (weight=1.0 ueberall, siehe Chat: dadurch
+        # dominierte weiterhin die unmaskierte Quellsingularitaet, mit
+        # massiven Folgen fuer die Line-Search). Fuer die Grenzsuche
+        # (z_top/x/y) daher eine ANDERE, fallback-faehige Koordinatenquelle
+        # wie `_find_grid_bins_3d` nutzen (echte x/y/z.bin liegen im
+        # LIVE-Solververzeichnis, nicht in output/MODEL_INIT). Getrennt von
+        # model_init_dir, da die beiden unterschiedliche Dateien brauchen.
+        coords_dir = os.path.join(self.cwd, "OUTPUT_FILES", "DATABASES_MPI")
+        z_top_global = _find_global_surface_z(coords_dir, zs_hint=zs, logger=logger)
+        if z_top_global is not None:
+            logger.info(f"[mask-3d] GLOBAL z_top={z_top_global:.6f} (from {coords_dir})")
+        else:
+            logger.warning("[mask-3d] GLOBAL z_top could not be determined; "
+                            "top-layer mask will be skipped.")
+
+        # PATCH MAX: Seitenrand-Maskierung fuer 3D. Die Basisversion
+        # (Specfem._horizontal_side_taper) maskiert nur die x-Achse (2D hat
+        # keine y-Achse) -- wir rufen dieselbe (dimensionsunabhaengige)
+        # Funktion zweimal auf, einmal je Achse, und multiplizieren die
+        # Gewichte. Grund fuer diese Maskierung: auch bei durchgaengig
+        # freien Raendern (kein Stacey) zeigt der rohe Adjoint-Kernel am
+        # seitlichen Modellrand eine deutlich erhoehte, nicht plausible
+        # Sensitivitaet (Rand-/Kanteneffekt der endlichen Modellgeometrie,
+        # unabhaengig vom Quelle/Empfaenger-Nahfeld).
+        x_left_global = x_right_global = y_front_global = y_back_global = None
+        if getattr(self, "mask_side_layer", False):
+            x_left_global, x_right_global = _find_global_x_bounds(coords_dir, logger=logger)
+            y_front_global, y_back_global = self._find_global_y_bounds(coords_dir, logger=logger)
+            if x_left_global is None or y_front_global is None:
+                logger.warning("[mask-3d] GLOBAL x/y bounds could not be "
+                               "determined; side-layer mask will be skipped.")
+
+        total_files = masked_files = 0
+        missing_grids = []
+
+        for par in parameters:
+            kfiles = []
+            for pat in self._kernel_file_patterns(input_path, par):
+                kfiles.extend(sorted(glob(pat)))
+            if not kfiles:
+                logger.warning(f"[mask-3d] par={par}: no kernel files matched "
+                               f"(ext='{self._ext}') -> skip")
+                continue
+
+            for kfile in kfiles:
+                total_files += 1
+                basename = os.path.basename(kfile)
+                proc = basename.split("_")[0]
+                logger.info(f"[mask-3d] par={par} {proc}: kfile={kfile}")
+
+                try:
+                    _crop_kernel_to_model_size(
+                        kfile, model_dir=model_init_dir,
+                        dtype="float32", backup=False, logger=logger,
+                    )
+                except Exception as e:
+                    logger.warning(f"[mask-3d] par={par} {proc}: precrop failed -> {e}")
+
+                xbin, ybin, zbin, ibin = self._find_grid_bins_3d(proc)
+                if not (xbin and ybin and zbin and ibin):
+                    missing_grids.append(proc)
+                    continue
+
+                try:
+                    x_glob = read_fortran_binary(xbin)
+                    y_glob = read_fortran_binary(ybin)
+                    z_glob = read_fortran_binary(zbin)
+                    ibool = self._read_fortran_int32(ibin)
+                except Exception as e:
+                    logger.warning(f"[mask-3d] par={par} {proc}: failed reading x/y/z/ibool -> {e}")
+                    continue
+                if not (x_glob.size == y_glob.size == z_glob.size):
+                    logger.warning(f"[mask-3d] par={par} {proc}: x/y/z size "
+                                   f"mismatch {x_glob.size}/{y_glob.size}/{z_glob.size} -> skip")
+                    continue
+
+                try:
+                    k = read_fortran_binary(kfile)
+                except Exception as e:
+                    logger.warning(f"[mask-3d] par={par} {proc}: failed reading kernel -> {e}")
+                    continue
+
+                # PATCH MAX: x/y/z liegen in NGLOB-Aufloesung vor (dedupliz.
+                # globale Knoten), k in NGLL^3*NSPEC-Aufloesung (pro Element,
+                # mit Duplikaten an Elementgrenzen) -- direktes Kuerzen auf
+                # min(x.size, k.size) wuerde NICHT nur falsch zuordnen,
+                # sondern beim Zurueckschreiben den Kernel dauerhaft auf die
+                # falsche (kleinere) Laenge kappen. Stattdessen ueber `ibool`
+                # (1-indiziert, gleiche Laenge wie k) korrekt expandieren.
+                if ibool.size != k.size:
+                    logger.warning(f"[mask-3d] par={par} {proc}: ibool/kernel "
+                                   f"size mismatch {ibool.size}/{k.size} -> skip")
+                    continue
+                idx = ibool - 1
+                x = x_glob[idx]
+                y = y_glob[idx]
+                z = z_glob[idx]
+
+                w = np.ones_like(k, dtype=np.float32)
+
+                if xs is not None and float(getattr(self, "mask_src_radius_m", 0)) > 0.0:
+                    w *= self._radial_cosine_taper_3d(
+                        x, y, z, xs, ys, zs,
+                        r0=float(self.mask_src_radius_m),
+                        rt=float(getattr(self, "mask_taper_m", 0.0)),
+                    )
+
+                if float(getattr(self, "mask_rec_radius_m", 0)) > 0.0 and stations:
+                    for (xr, yr, zr) in stations:
+                        w *= self._radial_cosine_taper_3d(
+                            x, y, z, xr, yr, zr,
+                            r0=float(self.mask_rec_radius_m),
+                            rt=float(getattr(self, "mask_taper_m", 0.0)),
+                        )
+
+                if (getattr(self, "mask_top_layer", False)
+                        and float(getattr(self, "mask_top_thickness_m", 0)) > 0.0
+                        and z_top_global is not None):
+                    w *= self._vertical_top_taper(
+                        z=z, z_top=float(z_top_global),
+                        thick=float(self.mask_top_thickness_m),
+                        taper=float(getattr(self, "mask_top_taper_m", 0.0)),
+                    )
+
+                if (getattr(self, "mask_side_layer", False)
+                        and float(getattr(self, "mask_side_thickness_m", 0)) > 0.0
+                        and x_left_global is not None and y_front_global is not None):
+                    # dieselbe (dimensionsunabhaengige) Basisfunktion einmal
+                    # je Achse aufrufen -- Details siehe Kommentar oben
+                    w *= self._horizontal_side_taper(
+                        x=x, x_left=float(x_left_global), x_right=float(x_right_global),
+                        thick=float(self.mask_side_thickness_m),
+                        taper=float(getattr(self, "mask_side_taper_m", 0.0)),
+                    )
+                    w *= self._horizontal_side_taper(
+                        x=y, x_left=float(y_front_global), x_right=float(y_back_global),
+                        thick=float(self.mask_side_thickness_m),
+                        taper=float(getattr(self, "mask_side_taper_m", 0.0)),
+                    )
+
+                frac_taper = float((w < 1.0).sum()) / float(w.size) if w.size else 0.0
+                logger.info(f"[mask-3d] {par} {proc}: weight stats min={w.min():.3f} "
+                            f"mean={w.mean():.3f} max={w.max():.3f} "
+                            f"muted={frac_taper*100:.1f}%")
+
+                before = float(np.linalg.norm(k)) if k.size else 0.0
+                k = k * w
+                after = float(np.linalg.norm(k)) if k.size else 0.0
+
+                try:
+                    write_fortran_binary(k.astype(np.float32), kfile)
+                    masked_files += 1
+                    logger.info(f"[mask-3d] {par} {proc}: |k|2 {before:.3e} -> "
+                                f"{after:.3e} | wrote {k.size} floats")
+                except Exception as e:
+                    logger.warning(f"[mask-3d] {par} {proc}: write failed -> {e}")
+                    continue
+
+        if missing_grids:
+            procs = ", ".join(sorted(set(missing_grids)))
+            raise RuntimeError(f"[mask-3d] Missing x/y/z grid bins for procs: {procs}")
+
+        logger.info(f"[mask-3d] EXIT _mask_gradient_near_sr: total={total_files}, "
+                    f"masked={masked_files}")
+        if masked_files == 0:
+            logger.warning("[mask-3d] completed but masked_files == 0 (no files written)")
 

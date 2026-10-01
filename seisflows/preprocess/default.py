@@ -781,8 +781,25 @@ def read_ascii(fid, origintime=None, **kwargs):
     if origintime is None:
         origintime = UTCDateTime("2000-01-01T00:00:00")
 
-    # Truncate after double precision due to floating point rounding, see #244
-    delta = round(times[1] - times[0], 14)
+    # PATCH MAX: delta ueber die GESAMTE Spur mitteln statt nur aus den ersten
+    # zwei Samples zu schaetzen (Original: `round(times[1] - times[0], 14)`).
+    # Grund: SPECFEM3D schreibt Zeitstempel einfach-genau im ASCII (E-Format,
+    # ~7 signifikante Stellen). Bei unserem sehr feinen DT=8e-8s ist das
+    # Rundungsrauschen einer EINZELNEN Zeitdifferenz in der Groessenordnung
+    # von DT selbst -- und dieses Rauschen skaliert mit dem Betrag von t0
+    # (=1.2/f0, haengt von der Quellfrequenz ab, siehe FORCESOLUTION
+    # hdurorf0). Da t0 zwischen den fixen "obs"-Daten (einmalig erzeugt,
+    # anderes f0) und den pro Stufe neu erzeugten "syn"-Daten (aendert sich
+    # mit dem Multiskalen-Frequenzplan) unterschiedlich ist, ergaben sich
+    # leicht unterschiedliche delta-Schaetzungen (z.B. 7.99992e-8 vs.
+    # 7.9977e-8 statt beide exakt 8e-8) -- das fuehrte bei manchen
+    # Frequenzstufen (aber nicht allen) zu einem Off-by-one-Sample in
+    # trim_streams() -> AssertionError "unable to trim streams and match
+    # endtimes" (beobachtet reproduzierbar bei 3kHz, nicht bei 2kHz).
+    # Fix: delta als Mittelwert ueber ALLE NSTEP-1 Intervalle schaetzen statt
+    # nur aus einem einzigen Sample-Paar -- mittelt das Rundungsrauschen weg
+    # und liefert fuer obs UND syn exakt denselben (korrekten) Wert.
+    delta = round(float((times[-1] - times[0]) / (len(times) - 1)), 14)
     if delta == 0:
         logger.critical("SPECFEM time step is too small, cannot resolve dt")
         sys.exit(-1)
